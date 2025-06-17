@@ -2063,7 +2063,8 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
             let mut stdin = io::stdin();
             loop {
                 // Raw console text until Ctrl-Q.
-                term::set_raw_console(true);
+                // [jocelynb] TODO: reintroduce this
+                // term::set_raw_console(true);
 
                 if let Some(input) = console_in.as_mut() {
                     let mut buf = [0; 32];
@@ -2083,7 +2084,8 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                     }
                 }
 
-                term::set_raw_console(false);
+                // [jocelynb] TODO: reintroduce this
+                // term::set_raw_console(false);
 
                 loop {
                     let line = rl.readline("openvmm> ");
