@@ -2060,29 +2060,29 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
 
             let mut parser = CommandParser::new();
 
-            let mut stdin = io::stdin();
+            //let mut stdin = io::stdin();
             loop {
                 // Raw console text until Ctrl-Q.
                 // [jocelynb] TODO: reintroduce this
                 // term::set_raw_console(true);
 
-                if let Some(input) = console_in.as_mut() {
-                    let mut buf = [0; 32];
-                    loop {
-                        let n = stdin.read(&mut buf).unwrap();
-                        let mut b = &buf[..n];
-                        let stop = if let Some(ctrlq) = b.iter().position(|x| *x == 0x11) {
-                            b = &b[..ctrlq];
-                            true
-                        } else {
-                            false
-                        };
-                        block_on(input.as_mut().write_all(b)).expect("BUGBUG");
-                        if stop {
-                            break;
-                        }
-                    }
-                }
+                // if let Some(input) = console_in.as_mut() {
+                //     let mut buf = [0; 32];
+                //     loop {
+                //         let n = stdin.read(&mut buf).unwrap();
+                //         let mut b = &buf[..n];
+                //         let stop = if let Some(ctrlq) = b.iter().position(|x| *x == 0x11) {
+                //             b = &b[..ctrlq];
+                //             true
+                //         } else {
+                //             false
+                //         };
+                //         block_on(input.as_mut().write_all(b)).expect("BUGBUG");
+                //         if stop {
+                //             break;
+                //         }
+                //     }
+                // }
 
                 // [jocelynb] TODO: reintroduce this
                 // term::set_raw_console(false);

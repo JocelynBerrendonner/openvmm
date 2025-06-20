@@ -4230,9 +4230,9 @@ dependencies = [
 
 [[package]]
 name = "mshv-bindings"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9c369385758f81ca937414dc2147737c92032e4fb399669f287abf94d89252d"
+checksum = "cd4aa8157010f69f380a86a0ba087167b0a01e2e3f2bcca5b576bd26a9206dc8"
 dependencies = [
  "libc",
  "num_enum",
@@ -4244,9 +4244,9 @@ dependencies = [
 
 [[package]]
 name = "mshv-ioctls"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53efb6110ead2e8788f79f2455b21464cb416ba9154112527b11584cb7fceea6"
+checksum = "f2bdc151fdc265efbb20f6c74e235dcdbce9a54e695655ac88b4db7385b26319"
 dependencies = [
  "libc",
  "mshv-bindings",
