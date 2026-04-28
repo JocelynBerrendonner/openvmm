@@ -194,7 +194,7 @@ pub fn load_uefi(
         cfg.add_raw(config::BlobStructureType::Ssdt, &ssdt.to_bytes());
     }
 
-    if !pcie_host_bridges.is_empty() {
+    if false && !pcie_host_bridges.is_empty() {
         let entries: Vec<config::PcieBarApertureEntry> = pcie_host_bridges
             .iter()
             .map(|b| config::PcieBarApertureEntry {
