@@ -105,12 +105,24 @@ pub(super) fn setup_smmu(
                 })?;
 
         shared_states[rc_pos] = Some(smmu_device.lock().shared_state().clone());
+        // When the SMMU is in accel mode (iommufd nested), the L1
+        // kernel's MSI reserved IOVA window must be identity-mapped in
+        // the L2 guest's S1 page tables. The window is 128MB–129MB
+        // (0x800_0000–0x80F_FFFF), which is the default ARM IOMMU MSI
+        // reserved region.
+        let reserved_iova_ranges = if inst.accel {
+            vec![(0x800_0000, 0x80F_FFFF)]
+        } else {
+            Vec::new()
+        };
+
         configs.push(vmm_core::acpi_builder::AcpiSmmuConfig {
             rc_index: pcie_host_bridges[rc_pos].index,
             segment: pcie_host_bridges[rc_pos].segment,
             base: smmu.base,
             event_gsiv: smmu.evtq_intid,
             gerr_gsiv: smmu.gerr_intid,
+            reserved_iova_ranges,
         });
     }
 

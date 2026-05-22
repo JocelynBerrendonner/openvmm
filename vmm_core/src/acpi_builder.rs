@@ -41,6 +41,11 @@ pub struct AcpiSmmuConfig {
     pub event_gsiv: u32,
     /// GIC SPI INTID for the global error interrupt.
     pub gerr_gsiv: u32,
+    /// IOVA ranges reserved by the host IOMMU (e.g., MSI windows).
+    /// Each entry is `(start_iova, last_iova)` inclusive. When non-empty,
+    /// an IORT RMR node (or DT `reserved-memory` entry) is generated so
+    /// the guest identity-maps these ranges in its S1 page tables.
+    pub reserved_iova_ranges: Vec<(u64, u64)>,
 }
 
 /// Binary ACPI tables constructed by [`AcpiTablesBuilder`].
@@ -586,7 +591,13 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
         };
         let its_node_count: u32 = if has_its { 1 } else { 0 };
         let smmu_node_count = smmu_configs.len() as u32;
-        let node_count = its_node_count + smmu_node_count + self.pcie_host_bridges.len() as u32;
+        // Count RMR nodes: one per SMMU with reserved IOVA ranges.
+        let rmr_node_count = smmu_configs
+            .iter()
+            .filter(|cfg| !cfg.reserved_iova_ranges.is_empty())
+            .count() as u32;
+        let node_count =
+            its_node_count + smmu_node_count + self.pcie_host_bridges.len() as u32 + rmr_node_count;
 
         let mut iort_extra: Vec<u8> = Vec::new();
 
@@ -710,6 +721,51 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
                     .as_bytes(),
                 );
             }
+        }
+
+        // RMR (Reserved Memory Range) nodes for SMMUs with reserved IOVA
+        // ranges (e.g., MSI windows). Each RMR node tells the guest kernel
+        // to identity-map the reserved ranges in S1 page tables.
+        for (cfg_idx, cfg) in smmu_configs.iter().enumerate() {
+            if cfg.reserved_iova_ranges.is_empty() {
+                continue;
+            }
+            let smmu_offset = smmu_rc_offsets
+                .iter()
+                .find(|(idx, _)| *idx == cfg.rc_index)
+                .map(|(_, off)| *off)
+                .expect("RMR config references a valid SMMU");
+
+            let rmr_count = cfg.reserved_iova_ranges.len() as u32;
+            // One ID mapping pointing to the SMMUv3 node, covering the
+            // full BDF range.
+            let mapping_count = 1u32;
+            let rmr = iort::IortRmr::new(
+                cfg_idx as u32 + 0x1000, // unique identifier
+                iort::IORT_RMR_ACCESS_PRIVILEGE,
+                rmr_count,
+                mapping_count,
+            );
+            iort_extra.extend_from_slice(rmr.as_bytes());
+
+            // RMR descriptors.
+            for &(start, last) in &cfg.reserved_iova_ranges {
+                let length = last - start + 1;
+                iort_extra
+                    .extend_from_slice(iort::IortRmrDescriptor::new(start, length).as_bytes());
+            }
+
+            // ID mapping: full BDF range → SMMUv3 node.
+            iort_extra.extend_from_slice(
+                iort::IortIdMapping::new(
+                    0,           // input_base
+                    0xFFFF,      // id_count (full 16-bit BDF range)
+                    0,           // output_base
+                    smmu_offset, // output_reference → SMMUv3 node
+                    0,           // flags
+                )
+                .as_bytes(),
+            );
         }
 
         (f)(&acpi::builder::Table::new_dyn(
@@ -1583,6 +1639,7 @@ mod test {
                     base: smmu_base,
                     event_gsiv: 35,
                     gerr_gsiv: 36,
+                    reserved_iova_ranges: Vec::new(),
                 }],
             },
         }
