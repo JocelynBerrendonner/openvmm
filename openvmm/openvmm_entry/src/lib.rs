@@ -1011,6 +1011,7 @@ async fn vm_config_from_command_line(
                             iommufd,
                             iommu_id: iommu_id.clone(),
                             bar_pt: cli_cfg.bar_pt,
+                            port_name: cli_cfg.port_name.clone(),
                         }
                         .into_resource(),
                     })

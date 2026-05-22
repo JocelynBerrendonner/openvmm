@@ -534,6 +534,8 @@ pub(crate) enum IoasManagerRpc {
     PrepareDevice {
         pci_id: String,
         cdev: File,
+        /// Whether this device needs iommufd nesting (S2 parent HWPT).
+        needs_nesting: bool,
         /// The response half of the original RPC from the resolver.
         respond: FailableRpc<(), CdevPrepareResponse>,
     },
@@ -556,6 +558,9 @@ struct IoasManager {
     #[inspect(skip)]
     ctx: Arc<vfio_sys::iommufd::IommufdCtx>,
     ioas_id: u32,
+    /// S2 parent HWPT for iommufd nested translation. Lazily allocated
+    /// on first device that requests nesting.
+    s2_parent_hwpt_id: Option<u32>,
     /// Keeps the DMA mapper registered with the region manager.
     #[inspect(skip)]
     _dma_handle: membacking::DmaMapperHandle,
@@ -606,6 +611,7 @@ impl IoasManager {
             iommu_id,
             ctx,
             ioas_id,
+            s2_parent_hwpt_id: None,
             _dma_handle: dma_handle,
             devices: Vec::new(),
             next_device_id: 0,
@@ -621,10 +627,13 @@ impl IoasManager {
                 IoasManagerRpc::PrepareDevice {
                     pci_id,
                     cdev,
+                    needs_nesting,
                     respond,
                 } => {
                     respond
-                        .handle_failable(async |()| self.prepare_device(pci_id, cdev))
+                        .handle_failable(async |()| {
+                            self.prepare_device(pci_id, cdev, needs_nesting)
+                        })
                         .await
                 }
                 IoasManagerRpc::RemoveDevice(device_id) => {
@@ -639,6 +648,7 @@ impl IoasManager {
         &mut self,
         pci_id: String,
         cdev_file: File,
+        needs_nesting: bool,
     ) -> anyhow::Result<CdevPrepareResponse> {
         let cdev = vfio_sys::cdev::CdevDevice::from_file(cdev_file);
 
@@ -647,9 +657,55 @@ impl IoasManager {
             .bind_iommufd(self.ctx.as_raw_fd())
             .context("failed to bind VFIO cdev to iommufd")?;
 
-        // Attach the device to the shared IOAS.
-        cdev.attach_ioas(self.ioas_id)
-            .context("failed to attach cdev device to IOAS")?;
+        // Build nesting context if requested. For nesting, the device
+        // is NOT attached to the IOAS directly — it will be attached to
+        // a nested HWPT by the IommufdStreamBackend. For non-nesting,
+        // attach to the IOAS for identity DMA.
+        let nesting_ctx = if needs_nesting {
+            // Lazily allocate S2 parent HWPT (one per IOAS).
+            let s2_hwpt_id = match self.s2_parent_hwpt_id {
+                Some(id) => id,
+                None => {
+                    let id = self
+                        .ctx
+                        .hwpt_alloc(
+                            vfio_sys::iommufd::IOMMU_HWPT_ALLOC_NEST_PARENT,
+                            devid,
+                            self.ioas_id,
+                            vfio_sys::iommufd::IOMMU_HWPT_DATA_NONE,
+                            0,
+                            0,
+                        )
+                        .context("failed to allocate S2 parent HWPT for nesting")?;
+                    tracing::info!(
+                        iommu_id = self.iommu_id,
+                        ioas_id = self.ioas_id,
+                        s2_parent_hwpt_id = id,
+                        "allocated S2 parent HWPT for iommufd nesting"
+                    );
+                    self.s2_parent_hwpt_id = Some(id);
+                    id
+                }
+            };
+
+            // Dup the cdev fd for the stream backend to use for
+            // attach/detach after CdevDevice::into_device() consumes
+            // the original.
+            let device_fd = cdev
+                .try_clone_fd()
+                .context("failed to dup cdev fd for nesting backend")?;
+
+            Some(NestingContext {
+                iommufd_ctx: self.ctx.clone(),
+                s2_parent_hwpt_id: s2_hwpt_id,
+                device_cdev_fd: device_fd,
+            })
+        } else {
+            // Normal path: attach to IOAS for identity DMA.
+            cdev.attach_ioas(self.ioas_id)
+                .context("failed to attach cdev device to IOAS")?;
+            None
+        };
 
         let device_id = self.next_device_id;
         self.next_device_id += 1;
@@ -665,7 +721,8 @@ impl IoasManager {
             iommufd_devid = devid,
             ioas_id = self.ioas_id,
             device_id,
-            "VFIO cdev device attached to IOAS"
+            needs_nesting,
+            "VFIO cdev device prepared"
         );
 
         Ok(CdevPrepareResponse {
@@ -674,6 +731,7 @@ impl IoasManager {
             ioas_id: self.ioas_id,
             device_id,
             manager_send: self.recv.sender(),
+            nesting_ctx,
         })
     }
 
@@ -707,6 +765,10 @@ pub(crate) struct CdevPrepareRequest {
     pub cdev: File,
     pub iommufd: File,
     pub iommu_id: String,
+    /// Whether the device needs iommufd nested translation (behind an
+    /// accel-capable SMMU). When true, the IoasManager allocates an S2
+    /// parent HWPT and returns the nesting context.
+    pub needs_nesting: bool,
 }
 
 /// Response payload for `PrepareDevice`.
@@ -717,6 +779,21 @@ pub(crate) struct CdevPrepareResponse {
     pub device_id: u64,
     /// Sender to the per-iommu manager for drop notification.
     pub manager_send: mesh::Sender<IoasManagerRpc>,
+    /// Nesting context for iommufd nested S1. Present when the device
+    /// was prepared with `needs_nesting: true`.
+    pub nesting_ctx: Option<NestingContext>,
+}
+
+/// Context for iommufd nested translation, returned from IoasManager
+/// when a device is behind an accel-capable SMMU.
+pub struct NestingContext {
+    /// Shared iommufd context (fd wrapper).
+    pub iommufd_ctx: Arc<vfio_sys::iommufd::IommufdCtx>,
+    /// S2 parent HWPT (nesting parent, linked to the IOAS).
+    pub s2_parent_hwpt_id: u32,
+    /// Dup'd VFIO cdev fd for the stream backend to issue
+    /// attach/detach ioctls after the original fd is consumed.
+    pub device_cdev_fd: File,
 }
 
 /// Dispatches cdev device requests to per-iommu [`IoasManager`] tasks.
@@ -811,6 +888,7 @@ impl VfioCdevManager {
             cdev,
             iommufd,
             iommu_id,
+            needs_nesting,
         } = req;
 
         let sender = match self.managers.entry(iommu_id.clone()) {
@@ -849,6 +927,7 @@ impl VfioCdevManager {
         sender.send(IoasManagerRpc::PrepareDevice {
             pci_id,
             cdev,
+            needs_nesting,
             respond,
         });
     }

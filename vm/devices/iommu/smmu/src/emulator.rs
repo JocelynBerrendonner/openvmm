@@ -34,6 +34,13 @@ pub struct SmmuConfig {
     /// Output address size in bits (e.g., 40 for 40-bit physical addresses).
     /// Must be one of: 32, 36, 40, 42, 44, 48, 52.
     pub oas: u8,
+    /// Enable HW-accelerated nested S1 translation (iommufd).
+    ///
+    /// When true, VFIO cdev devices behind this SMMU use hardware-
+    /// accelerated translation and are not wrapped with software
+    /// `SmmuTranslatingMemory`. The SMMU still emulates registers
+    /// and dispatches CMDQ commands to iommufd backends.
+    pub accel: bool,
 }
 
 impl Default for SmmuConfig {
@@ -41,6 +48,7 @@ impl Default for SmmuConfig {
         Self {
             sidsize: 16,
             oas: 40,
+            accel: false,
         }
     }
 }
@@ -170,8 +178,13 @@ impl SmmuDevice {
         // GBPA defaults to ABORT=1 (abort all transactions when SMMU is disabled).
         let gbpa = registers::Gbpa::new().with_abort(true);
 
-        let shared_state =
-            SmmuSharedState::new(guest_memory.clone(), config.oas, evtq_irq, gerror_irq);
+        let shared_state = SmmuSharedState::new(
+            guest_memory.clone(),
+            config.oas,
+            config.accel,
+            evtq_irq,
+            gerror_irq,
+        );
 
         SmmuDevice {
             mmio_region: (

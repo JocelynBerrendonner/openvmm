@@ -10,8 +10,11 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use membacking::DmaMapperClient;
 use pal_async::task::Spawn as _;
+use parking_lot::RwLock;
+use pci_core::bus_range::AssignedBusRange;
 use pci_resources::ResolvePciDeviceHandleParams;
 use pci_resources::ResolvedPciDevice;
+use std::collections::HashMap;
 use std::sync::Arc;
 use vfio_assigned_device_resources::VfioCdevDeviceHandle;
 use vfio_assigned_device_resources::VfioDeviceHandle;
@@ -109,9 +112,79 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioDeviceHandle> for VfioDeviceR
 ///
 /// Spawns a `VfioCdevManager` task internally and communicates with it via RPC
 /// to share IOAS contexts across devices referencing the same iommu ID.
+///
+/// When a nesting store is provided, devices whose `port_name` is registered
+/// in the store get iommufd nested S1 translation: the resolver allocates the
+/// S2 parent HWPT, creates the per-SMMU accel state and per-device stream
+/// backend, and registers the backend with the SMMU shared state.
 pub struct VfioCdevDeviceResolver {
     client: crate::manager::VfioCdevManagerClient,
     _task: pal_async::task::Task<()>,
+    /// SMMU nesting context for each port behind an accel-capable SMMU.
+    nesting_store: Arc<SmmuNestingStore>,
+}
+
+/// Shared store mapping port names to SMMU nesting context.
+///
+/// Populated by dispatch.rs after SMMU setup, before device resolution.
+/// The resolver reads from this store during device resolution to determine
+/// whether a VFIO cdev device should use iommufd nested translation.
+pub struct SmmuNestingStore {
+    entries: RwLock<HashMap<String, SmmuNestingEntry>>,
+}
+
+/// Per-port SMMU nesting context.
+pub struct SmmuNestingEntry {
+    /// SMMU shared state for the root complex this port belongs to.
+    pub smmu_shared: Arc<smmu::SmmuSharedState>,
+    /// The device's assigned bus range (shared with the PCIe port).
+    pub bus_range: AssignedBusRange,
+    /// Offset into the SMMU's stream table (0 for 1:1 SMMU-per-RC).
+    pub stream_id_base: u32,
+}
+
+impl SmmuNestingStore {
+    /// Create an empty nesting store.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entries: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Register a port for SMMU nesting.
+    pub fn register(
+        &self,
+        port_name: String,
+        smmu_shared: Arc<smmu::SmmuSharedState>,
+        bus_range: AssignedBusRange,
+        stream_id_base: u32,
+    ) {
+        self.entries.write().insert(
+            port_name,
+            SmmuNestingEntry {
+                smmu_shared,
+                bus_range,
+                stream_id_base,
+            },
+        );
+    }
+
+    /// Look up the nesting entry for a port.
+    fn get(&self, port_name: &str) -> Option<SmmuNestingEntryRef> {
+        let entries = self.entries.read();
+        entries.get(port_name).map(|e| SmmuNestingEntryRef {
+            smmu_shared: e.smmu_shared.clone(),
+            bus_range: e.bus_range.clone(),
+            stream_id_base: e.stream_id_base,
+        })
+    }
+}
+
+/// Cloned reference to a nesting entry (avoids holding the lock).
+struct SmmuNestingEntryRef {
+    smmu_shared: Arc<smmu::SmmuSharedState>,
+    bus_range: AssignedBusRange,
+    stream_id_base: u32,
 }
 
 impl VfioCdevDeviceResolver {
@@ -119,6 +192,7 @@ impl VfioCdevDeviceResolver {
     pub fn new(
         spawner: impl pal_async::task::Spawn + 'static,
         dma_mapper_client: DmaMapperClient,
+        nesting_store: Arc<SmmuNestingStore>,
     ) -> Self {
         // Arc the spawner so the dispatcher can spawn per-iommu manager tasks.
         let spawner: Arc<dyn pal_async::task::Spawn> = Arc::new(spawner);
@@ -128,6 +202,7 @@ impl VfioCdevDeviceResolver {
         Self {
             client,
             _task: task,
+            nesting_store,
         }
     }
 
@@ -154,9 +229,20 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
             iommufd,
             iommu_id,
             bar_pt,
+            port_name,
         } = resource;
 
-        tracing::info!(pci_id, iommu_id, "opening VFIO cdev device with iommufd");
+        // Check if this device is behind an accel-capable SMMU.
+        let nesting_entry = self.nesting_store.get(&port_name);
+        let needs_nesting = nesting_entry.is_some();
+
+        tracing::info!(
+            pci_id,
+            iommu_id,
+            port_name,
+            needs_nesting,
+            "opening VFIO cdev device with iommufd"
+        );
 
         let resp = self
             .client
@@ -165,9 +251,42 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
                 cdev,
                 iommufd,
                 iommu_id,
+                needs_nesting,
             })
             .await
             .context("VFIO cdev manager failed")?;
+
+        // If nesting, create the iommufd nesting backend and register
+        // it with the SMMU shared state.
+        if let (Some(entry), Some(nesting_ctx)) = (nesting_entry, &resp.nesting_ctx) {
+            let accel_state = crate::iommufd_nesting::SmmuAccelState::new(
+                nesting_ctx.iommufd_ctx.clone(),
+                resp.iommufd_devid,
+                nesting_ctx.s2_parent_hwpt_id,
+            )
+            .with_context(|| format!("failed to create SMMU accel state for device {pci_id}"))?;
+
+            let backend = Arc::new(crate::iommufd_nesting::IommufdStreamBackend::new(
+                Arc::new(accel_state),
+                resp.iommufd_devid,
+                nesting_ctx
+                    .device_cdev_fd
+                    .try_clone()
+                    .context("failed to dup cdev fd for stream backend")?,
+            ));
+
+            entry.smmu_shared.register_accel_device(
+                entry.bus_range.clone(),
+                entry.stream_id_base,
+                backend,
+            );
+
+            tracing::info!(
+                pci_id,
+                port_name,
+                "registered iommufd nesting backend with SMMU"
+            );
+        }
 
         let cdev_binding = crate::manager::VfioCdevBinding::from_response(resp, pci_id.clone());
 

@@ -87,6 +87,7 @@ pub(super) fn setup_smmu(
         let smmu_config = smmu::SmmuConfig {
             sidsize: 16,
             oas: 44,
+            accel: inst.accel,
         };
         let smmu_device =
             chipset_builder

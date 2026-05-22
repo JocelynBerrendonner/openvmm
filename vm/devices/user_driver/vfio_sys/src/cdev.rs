@@ -152,6 +152,14 @@ impl CdevDevice {
     pub fn into_device(self) -> super::Device {
         super::Device { file: self.file }
     }
+
+    /// Duplicate the underlying cdev file descriptor.
+    ///
+    /// Used to retain attach/detach capability after [`Self::into_device`]
+    /// consumes the original `CdevDevice`.
+    pub fn try_clone_fd(&self) -> anyhow::Result<fs::File> {
+        self.file.try_clone().context("failed to dup cdev fd")
+    }
 }
 
 impl AsRef<fs::File> for CdevDevice {

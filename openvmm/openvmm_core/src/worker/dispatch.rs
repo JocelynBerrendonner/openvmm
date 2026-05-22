@@ -2224,7 +2224,8 @@ impl InitializedVm {
         // Register the VFIO resolver, which spawns a container manager task
         // internally to share containers across assigned devices.
         #[cfg(target_os = "linux")]
-        let (vfio_inspect, vfio_cdev_inspect) = {
+        #[cfg_attr(not(guest_arch = "aarch64"), expect(unused_variables))]
+        let (vfio_inspect, vfio_cdev_inspect, nesting_store) = {
             let dma_mapper_client = memory_manager.dma_mapper_client();
             let vfio_resolver = vfio_assigned_device::resolver::VfioDeviceResolver::new(
                 driver_source.builder().build("vfio-container-mgr"),
@@ -2238,12 +2239,18 @@ impl InitializedVm {
                 _,
             >(vfio_resolver);
 
+            // Create the nesting store for SMMU accel integration.
+            // Populated later (after SMMU setup) with per-port nesting
+            // context for VFIO cdev devices behind accel-capable SMMUs.
+            let nesting_store = vfio_assigned_device::resolver::SmmuNestingStore::new();
+
             // Register the VFIO cdev + iommufd resolver for devices opened
             // via the cdev interface. Spawns a VfioCdevManager task that
             // shares IOAS contexts across devices with the same --iommu ID.
             let cdev_resolver = vfio_assigned_device::resolver::VfioCdevDeviceResolver::new(
                 driver_source.builder().build("vfio-cdev-mgr"),
                 dma_mapper_client,
+                nesting_store.clone(),
             );
             let cdev_handle = cdev_resolver.inspect_handle();
             resolver.add_async_resolver::<
@@ -2253,7 +2260,7 @@ impl InitializedVm {
                 _,
             >(cdev_resolver);
 
-            (Some(handle), Some(cdev_handle))
+            (Some(handle), Some(cdev_handle), nesting_store)
         };
 
         // Instantiate SMMU devices and build port-level lookup maps.
@@ -2319,6 +2326,23 @@ impl InitializedVm {
         // IOVAs using the port's assigned bus range and remap MSIs using
         // the requester ID supplied by the PCI MSI path.
 
+        // Populate the VFIO cdev nesting store for accel-capable SMMUs.
+        // Each VFIO cdev port behind an accel SMMU gets a nesting entry
+        // so the resolver can create iommufd nested backends.
+        #[cfg(all(guest_arch = "aarch64", target_os = "linux"))]
+        for (port_name, pi) in &port_info {
+            if let Some(smmu_shared) = &smmu_shared_states[pi.rc_idx] {
+                if smmu_shared.is_accel() {
+                    nesting_store.register(
+                        port_name.to_string(),
+                        smmu_shared.clone(),
+                        pi.bus_range.clone(),
+                        0, // stream_id_base = 0 for 1:1 SMMU-per-RC
+                    );
+                }
+            }
+        }
+
         try_join_all(cfg.pcie_devices.into_iter().map(|dev_cfg| {
             let chipset_builder = &chipset_builder;
             let driver_source = &driver_source;
@@ -2343,6 +2367,23 @@ impl InitializedVm {
 
                 let msi_conn = pci_core::msi::MsiConnection::new(pi.bus_range.clone(), 0);
 
+                // When a device is behind an accel-capable SMMU and is a
+                // VFIO cdev device (HW-accelerated S1), skip the software
+                // SMMU wrapping — the device's DMA goes through the host
+                // IOMMU via iommufd nested HWPTs, not through GuestMemory.
+                // Emulated devices on the same RC still get software wrapping.
+                #[cfg(guest_arch = "aarch64")]
+                let smmu_for_device = {
+                    let smmu = smmu_states[pi.rc_idx].as_ref();
+                    let is_accel = smmu.map_or(false, |s| s.is_accel());
+                    let is_cdev = dev_cfg.resource.id() == "vfio-cdev";
+                    if is_accel && is_cdev {
+                        None // Skip SMMU wrapping — HW handles translation
+                    } else {
+                        smmu
+                    }
+                };
+
                 let pcie_ctx =
                     pcie_wiring::build_device_wiring(pcie_wiring::PcieDeviceWiringParams {
                         msi_platform: pcie_wiring::PcieMsiPlatform {
@@ -2355,7 +2396,7 @@ impl InitializedVm {
                         guest_memory: gm,
                         bus_range: &pi.bus_range,
                         #[cfg(guest_arch = "aarch64")]
-                        smmu: smmu_states[pi.rc_idx].as_ref(),
+                        smmu: smmu_for_device,
                     });
 
                 vmm_core::device_builder::build_pcie_device(

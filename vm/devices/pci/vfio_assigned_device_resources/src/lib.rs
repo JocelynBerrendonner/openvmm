@@ -50,6 +50,11 @@ pub struct VfioCdevDeviceHandle {
     /// Per-BAR passthrough flags. When `bar_pt[i]` is true, the virtual
     /// BAR is pre-programmed with the physical BAR address (GPA = HPA).
     pub bar_pt: [bool; 6],
+    /// PCIe port name this device is plugged into (e.g., "rp0").
+    ///
+    /// Used by the resolver to look up SMMU nesting context — the port
+    /// determines which SMMU (if any) covers the device.
+    pub port_name: String,
 }
 
 impl ResourceId<PciDeviceHandleKind> for VfioCdevDeviceHandle {

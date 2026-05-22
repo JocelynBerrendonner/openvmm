@@ -29,8 +29,8 @@ use guestmem::GuestMemory;
 use pal_event::Event;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::SignalMsi;
-use std::collections::HashMap;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -68,6 +68,20 @@ pub trait AcceleratedStreamBackend: Send + Sync {
     /// forwarded to iommufd via `IOMMU_HWPT_INVALIDATE`. The kernel
     /// parses the opcode and operands.
     fn on_tlbi(&self, cmd_bytes: &[u8; 16]) -> anyhow::Result<()>;
+}
+
+/// Registration entry for a VFIO device with iommufd-accelerated translation.
+///
+/// The SID is derived dynamically from the `bus_range` (which holds the
+/// guest-assigned bus number) rather than being fixed at registration time,
+/// because PCIe bus numbers are assigned by the guest during enumeration.
+struct AccelDeviceRegistration {
+    /// The device's assigned bus range (shared with the PCIe port).
+    bus_range: AssignedBusRange,
+    /// Offset into this SMMU's stream table for the device's root complex.
+    stream_id_base: u32,
+    /// The iommufd-backed stream handler.
+    backend: Arc<dyn AcceleratedStreamBackend>,
 }
 
 /// Composes an SMMU-local stream ID from a bus range, a base offset,
@@ -150,11 +164,19 @@ pub struct SmmuSharedState {
     evtq_irq: Option<LineInterrupt>,
     /// Wired SPI interrupt line for global error signaling.
     gerror_irq: Option<LineInterrupt>,
-    /// Per-stream accelerated backends (VFIO devices with iommufd nested).
+    /// Whether this SMMU is in accelerated mode (iommufd nested).
     ///
-    /// Streams not in this map use the software page table walk path.
-    /// Keyed by SMMU-local stream ID.
-    stream_backends: RwLock<HashMap<u32, Arc<dyn AcceleratedStreamBackend>>>,
+    /// When `true`, VFIO cdev devices behind this SMMU use hardware-
+    /// accelerated S1 translation and are not wrapped with software
+    /// `SmmuTranslatingMemory`. When `false`, all devices use the
+    /// software page table walk path.
+    accel: bool,
+    /// Per-device accelerated backends (VFIO devices with iommufd nested).
+    ///
+    /// Devices not in this list use the software page table walk path.
+    /// The SID is derived dynamically from each entry's `AssignedBusRange`
+    /// because bus numbers are guest-assigned after device construction.
+    accel_devices: RwLock<Vec<AccelDeviceRegistration>>,
 }
 
 struct SharedStateInner {
@@ -220,6 +242,7 @@ impl SmmuSharedState {
     pub fn new(
         guest_memory: GuestMemory,
         oas_bits: u8,
+        accel: bool,
         evtq_irq: Option<LineInterrupt>,
         gerror_irq: Option<LineInterrupt>,
     ) -> Arc<Self> {
@@ -245,8 +268,14 @@ impl SmmuSharedState {
             }),
             evtq_irq,
             gerror_irq,
-            stream_backends: RwLock::new(HashMap::new()),
+            accel,
+            accel_devices: RwLock::new(Vec::new()),
         })
+    }
+
+    /// Returns whether this SMMU is in accelerated mode (iommufd nested).
+    pub fn is_accel(&self) -> bool {
+        self.accel
     }
 
     /// Updates the SMMU enable state (called by SmmuDevice on CR0 writes).
@@ -436,21 +465,42 @@ impl SmmuSharedState {
         }
     }
 
-    /// Register an accelerated backend for a stream ID.
+    /// Register an accelerated backend for a VFIO device.
     ///
-    /// VFIO devices with iommufd nested support register their stream IDs
-    /// during chipset construction. When the guest writes `CFGI_STE` or
-    /// TLBI commands for a registered stream, the emulator forwards the
-    /// raw command data to the backend instead of using software walk.
-    pub fn register_stream_backend(&self, sid: u32, backend: Arc<dyn AcceleratedStreamBackend>) {
-        self.stream_backends.write().insert(sid, backend);
+    /// The device's stream ID is derived dynamically from `bus_range`
+    /// (which holds the guest-assigned bus number) rather than being
+    /// fixed at registration time. When the guest writes `CFGI_STE` or
+    /// TLBI commands, the emulator matches the command's SID against
+    /// each registered device's current bus assignment.
+    pub fn register_accel_device(
+        &self,
+        bus_range: AssignedBusRange,
+        stream_id_base: u32,
+        backend: Arc<dyn AcceleratedStreamBackend>,
+    ) {
+        self.accel_devices.write().push(AccelDeviceRegistration {
+            bus_range,
+            stream_id_base,
+            backend,
+        });
     }
 
     /// Look up the accelerated backend for a stream ID.
     ///
-    /// Returns `None` for emulated devices (software walk path).
+    /// Iterates registered accel devices and computes the current SID
+    /// from each device's `AssignedBusRange`. Returns `None` for
+    /// emulated devices (software walk path) or devices whose bus
+    /// number has not been assigned yet.
     pub fn get_stream_backend(&self, sid: u32) -> Option<Arc<dyn AcceleratedStreamBackend>> {
-        self.stream_backends.read().get(&sid).cloned()
+        let devices = self.accel_devices.read();
+        for reg in devices.iter() {
+            if let Some(dev_sid) = compose_stream_id(&reg.bus_range, reg.stream_id_base, None) {
+                if dev_sid == sid {
+                    return Some(reg.backend.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Returns all registered accelerated stream backends.
@@ -458,18 +508,26 @@ impl SmmuSharedState {
     /// Used by CMDQ processing to forward broadcast TLBI commands to all
     /// accelerated streams.
     pub fn all_stream_backends(&self) -> Vec<Arc<dyn AcceleratedStreamBackend>> {
-        self.stream_backends.read().values().cloned().collect()
-    }
-
-    /// Returns all registered stream backend entries (SID, backend) pairs.
-    ///
-    /// Used by CMDQ processing for broadcast CFGI_STE_RANGE (CFGI_ALL)
-    /// to re-read each accelerated stream's STE.
-    pub fn stream_backend_entries(&self) -> Vec<(u32, Arc<dyn AcceleratedStreamBackend>)> {
-        self.stream_backends
+        self.accel_devices
             .read()
             .iter()
-            .map(|(&sid, backend)| (sid, backend.clone()))
+            .map(|reg| reg.backend.clone())
+            .collect()
+    }
+
+    /// Returns all registered stream backend entries as (SID, backend) pairs.
+    ///
+    /// Used by CMDQ processing for broadcast CFGI_STE_RANGE (CFGI_ALL)
+    /// to re-read each accelerated stream's STE. Entries whose bus number
+    /// has not been assigned yet are skipped.
+    pub fn stream_backend_entries(&self) -> Vec<(u32, Arc<dyn AcceleratedStreamBackend>)> {
+        self.accel_devices
+            .read()
+            .iter()
+            .filter_map(|reg| {
+                let sid = compose_stream_id(&reg.bus_range, reg.stream_id_base, None)?;
+                Some((sid, reg.backend.clone()))
+            })
             .collect()
     }
 
@@ -1043,7 +1101,7 @@ mod tests {
     }
 
     fn make_shared_state(gm: &GuestMemory) -> Arc<SmmuSharedState> {
-        let state = SmmuSharedState::new(gm.clone(), 40, None, None);
+        let state = SmmuSharedState::new(gm.clone(), 40, false, None, None);
         state.set_strtab(STRTAB_BASE, STRTAB_LOG2SIZE);
         state.set_enabled(true);
         // Enable EVTQ so fault events are written to guest memory.
@@ -1270,7 +1328,7 @@ mod tests {
         let data = b"disabled smmu";
         gm.write_at(0x3000, data).unwrap();
 
-        let state = SmmuSharedState::new(gm.clone(), 40, None, None);
+        let state = SmmuSharedState::new(gm.clone(), 40, false, None, None);
         let bus_range = make_bus_range();
         let mock_msi = MockSignalMsi::new();
 
