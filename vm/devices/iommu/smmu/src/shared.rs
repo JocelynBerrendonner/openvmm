@@ -30,11 +30,88 @@ use pal_event::Event;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use pci_core::msi::SignalMsi;
+use std::collections::HashMap;
+use std::fmt;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use vmcore::irqfd::IrqFd;
 use vmcore::irqfd::IrqFdRoute;
 use vmcore::line_interrupt::LineInterrupt;
 use zerocopy::IntoBytes;
+
+/// Backend for a single VFIO device's stream, bridging SMMU CMDQ commands
+/// to iommufd nested HWPT operations.
+///
+/// The SMMU emulator dispatches CMDQ commands to registered backends on a
+/// per-stream-ID basis. Streams without a registered backend use the
+/// software page table walk path (emulated devices). Streams with a backend
+/// use hardware-accelerated translation via iommufd.
+///
+/// The VMM passes raw STE bytes and raw command bytes to the backend,
+/// following QEMU's proven approach: the kernel parses the STE and command
+/// formats, not the VMM. This is simpler and forward-compatible with new
+/// command variants.
+pub trait AcceleratedStreamBackend: Send + Sync {
+    /// Guest wrote `CFGI_STE` for this stream. The 64-byte STE is read from
+    /// guest memory by the caller.
+    ///
+    /// The backend dispatches on `STE.Config`:
+    /// - `ABORT` (0): detach from nested HWPT, attach abort HWPT
+    /// - `BYPASS` (4): detach from nested HWPT, attach bypass HWPT
+    /// - `S1_TRANS` (5): mask STE DW0-1, call `IOMMU_HWPT_ALLOC` nested
+    fn on_cfgi_ste(&self, ste_bytes: &[u8; 64]) -> anyhow::Result<()>;
+
+    /// Guest issued a TLBI command. The raw 16-byte command entry is
+    /// forwarded to iommufd via `IOMMU_HWPT_INVALIDATE`. The kernel
+    /// parses the opcode and operands.
+    fn on_tlbi(&self, cmd_bytes: &[u8; 16]) -> anyhow::Result<()>;
+}
+
+/// Composes an SMMU-local stream ID from a bus range, a base offset,
+/// and an optional per-device BDF.
+///
+/// The stream ID is `stream_id_base + (bdf & 0xFFFF)`. When `devid`
+/// is `None`, the default BDF `(secondary_bus, dev 0, fn 0)` is used.
+///
+/// Returns `None` if the secondary bus has not been assigned yet
+/// (still 0) or if the BDF's bus number falls outside the port's
+/// assigned range.
+fn compose_stream_id(
+    bus_range: &AssignedBusRange,
+    stream_id_base: u32,
+    devid: Option<u32>,
+) -> Option<u32> {
+    let (secondary, subordinate) = bus_range.bus_range();
+    if secondary == 0 {
+        return None;
+    }
+    let bdf = devid.unwrap_or((secondary as u32) << 8);
+    let bus = (bdf >> 8) as u8;
+    if bus < secondary || bus > subordinate {
+        tracelimit::warn_ratelimited!(bus, secondary, subordinate, "BDF out of port bus range");
+        return None;
+    }
+    Some(stream_id_base + (bdf & 0xFFFF))
+}
+
+/// Translation error for SMMU DMA access.
+#[derive(Debug)]
+struct SmmuTranslationError {
+    iova: u64,
+    msg: &'static str,
+}
+
+impl fmt::Display for SmmuTranslationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SMMU translation failed: {} at IOVA {:#x}",
+            self.msg, self.iova
+        )
+    }
+}
+
+impl std::error::Error for SmmuTranslationError {}
 
 /// Result of an SMMU translation attempt.
 #[derive(Debug)]
@@ -70,6 +147,11 @@ pub struct SmmuSharedState {
     evtq_irq: Option<LineInterrupt>,
     /// Wired SPI interrupt line for global error signaling.
     gerror_irq: Option<LineInterrupt>,
+    /// Per-stream accelerated backends (VFIO devices with iommufd nested).
+    ///
+    /// Streams not in this map use the software page table walk path.
+    /// Keyed by SMMU-local stream ID.
+    stream_backends: RwLock<HashMap<u32, Arc<dyn AcceleratedStreamBackend>>>,
 }
 
 struct SharedStateInner {
@@ -160,6 +242,7 @@ impl SmmuSharedState {
             }),
             evtq_irq,
             gerror_irq,
+            stream_backends: RwLock::new(HashMap::new()),
         })
     }
 
@@ -348,6 +431,56 @@ impl SmmuSharedState {
                 irq.set_level(qs.evtq_prod != qs.evtq_cons);
             }
         }
+    }
+
+    /// Register an accelerated backend for a stream ID.
+    ///
+    /// VFIO devices with iommufd nested support register their stream IDs
+    /// during chipset construction. When the guest writes `CFGI_STE` or
+    /// TLBI commands for a registered stream, the emulator forwards the
+    /// raw command data to the backend instead of using software walk.
+    pub fn register_stream_backend(&self, sid: u32, backend: Arc<dyn AcceleratedStreamBackend>) {
+        self.stream_backends.write().insert(sid, backend);
+    }
+
+    /// Look up the accelerated backend for a stream ID.
+    ///
+    /// Returns `None` for emulated devices (software walk path).
+    pub fn get_stream_backend(&self, sid: u32) -> Option<Arc<dyn AcceleratedStreamBackend>> {
+        self.stream_backends.read().get(&sid).cloned()
+    }
+
+    /// Returns all registered accelerated stream backends.
+    ///
+    /// Used by CMDQ processing to forward broadcast TLBI commands to all
+    /// accelerated streams.
+    pub fn all_stream_backends(&self) -> Vec<Arc<dyn AcceleratedStreamBackend>> {
+        self.stream_backends.read().values().cloned().collect()
+    }
+
+    /// Returns all registered stream backend entries (SID, backend) pairs.
+    ///
+    /// Used by CMDQ processing for broadcast CFGI_STE_RANGE (CFGI_ALL)
+    /// to re-read each accelerated stream's STE.
+    pub fn stream_backend_entries(&self) -> Vec<(u32, Arc<dyn AcceleratedStreamBackend>)> {
+        self.stream_backends
+            .read()
+            .iter()
+            .map(|(&sid, backend)| (sid, backend.clone()))
+            .collect()
+    }
+
+    /// Returns the guest memory handle for reading page tables and STEs.
+    pub fn guest_memory(&self) -> &GuestMemory {
+        &self.guest_memory
+    }
+
+    /// Returns the stream table base address and log2 size.
+    ///
+    /// Used by CMDQ processing to read STE bytes for accelerated streams.
+    pub fn strtab_config(&self) -> (u64, u8) {
+        let inner = self.inner.read();
+        (inner.strtab_base, inner.strtab_log2size)
     }
 
     /// Translate an IOVA to a GPA for the given stream ID.

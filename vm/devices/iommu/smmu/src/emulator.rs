@@ -4,11 +4,13 @@
 //! SMMUv3 device emulator — register file and MMIO dispatch.
 
 use crate::shared::SmmuSharedState;
+use crate::spec::commands::CmdCfgiSte;
 use crate::spec::commands::CmdEntry;
 use crate::spec::commands::CmdOpcode;
 use crate::spec::commands::CmdSync;
 use crate::spec::commands::SyncCs;
 use crate::spec::registers;
+use crate::spec::ste::Ste;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
@@ -552,20 +554,64 @@ impl SmmuDevice {
             };
 
             match entry.opcode() {
-                // Configuration invalidation commands — no-op (no cache yet).
+                // Configuration invalidation: CFGI_STE — forward to backend if registered.
+                CmdOpcode::CFGI_STE => {
+                    let cmd = CmdCfgiSte::from(entry.qw0);
+                    let sid = cmd.sid();
+                    if let Some(backend) = self.shared_state.get_stream_backend(sid) {
+                        self.dispatch_cfgi_ste(sid, &*backend);
+                    }
+                    // Emulated devices: no-op (no STE cache).
+                }
+
+                // CFGI_STE_RANGE: forward each matching backend.
+                CmdOpcode::CFGI_STE_RANGE => {
+                    // When Range=31 (CFGI_ALL), all backends get notified.
+                    // For other ranges, we'd need to iterate the SID range,
+                    // but Range=31 is the only value Linux uses at init.
+                    // For now, treat all ranges as broadcast to all backends.
+                    let backends = self.shared_state.all_stream_backends();
+                    if !backends.is_empty() {
+                        // For CFGI_ALL, re-read each backend's STE.
+                        for (sid, backend) in self.shared_state.stream_backend_entries() {
+                            self.dispatch_cfgi_ste(sid, &*backend);
+                        }
+                    }
+                }
+
+                // Configuration invalidation: CFGI_CD — no-op for emulated devices.
+                // For accelerated streams, CD invalidation is handled by the
+                // kernel when it re-reads the CD table via the STE's S1ContextPtr.
                 CmdOpcode::PREFETCH_CFG
-                | CmdOpcode::CFGI_STE
-                | CmdOpcode::CFGI_STE_RANGE
                 | CmdOpcode::CFGI_CD
                 | CmdOpcode::CFGI_CD_ALL => {}
 
-                // TLB invalidation commands — no-op (no TLB yet).
+                // TLB invalidation commands — forward to all accelerated backends.
                 CmdOpcode::TLBI_NH_ALL
                 | CmdOpcode::TLBI_NH_ASID
                 | CmdOpcode::TLBI_NH_VA
                 | CmdOpcode::TLBI_NH_VAA
                 | CmdOpcode::TLBI_S12_VMALL
-                | CmdOpcode::TLBI_NSNH_ALL => {}
+                | CmdOpcode::TLBI_NSNH_ALL => {
+                    let backends = self.shared_state.all_stream_backends();
+                    if !backends.is_empty() {
+                        let cmd_bytes: [u8; 16] = {
+                            let mut buf = [0u8; 16];
+                            buf[..8].copy_from_slice(&entry.qw0.to_le_bytes());
+                            buf[8..].copy_from_slice(&entry.qw1.to_le_bytes());
+                            buf
+                        };
+                        for backend in &backends {
+                            if let Err(e) = backend.on_tlbi(&cmd_bytes) {
+                                tracelimit::warn_ratelimited!(
+                                    error = &*e as &dyn std::error::Error,
+                                    "smmu: accelerated TLBI failed"
+                                );
+                            }
+                        }
+                    }
+                    // Emulated devices: no-op (no TLB cache).
+                }
 
                 // Synchronization command.
                 CmdOpcode::CMD_SYNC => {
@@ -639,6 +685,45 @@ impl SmmuDevice {
         self.cmdq_cons.set_err(error.0);
         // Toggle GERROR.CMDQ_ERR and update interrupt line (atomic).
         self.shared_state.toggle_cmdq_err();
+    }
+
+    /// Read the STE for `sid` from guest memory and forward to the
+    /// accelerated backend.
+    fn dispatch_cfgi_ste(
+        &self,
+        sid: u32,
+        backend: &dyn crate::shared::AcceleratedStreamBackend,
+    ) {
+        let (strtab_base, strtab_log2size) = self.shared_state.strtab_config();
+        let max_streams = 1u64 << strtab_log2size;
+        if (sid as u64) >= max_streams {
+            tracelimit::warn_ratelimited!(
+                sid,
+                max_streams,
+                "smmu: CFGI_STE for out-of-range SID (accelerated)"
+            );
+            return;
+        }
+
+        let ste_addr = strtab_base + (sid as u64) * (size_of::<Ste>() as u64);
+        let mut ste_bytes = [0u8; 64];
+        if let Err(e) = self.guest_memory.read_at(ste_addr, &mut ste_bytes) {
+            tracelimit::warn_ratelimited!(
+                error = &e as &dyn std::error::Error,
+                ste_addr,
+                sid,
+                "smmu: failed to read STE for accelerated CFGI_STE"
+            );
+            return;
+        }
+
+        if let Err(e) = backend.on_cfgi_ste(&ste_bytes) {
+            tracelimit::warn_ratelimited!(
+                error = &*e as &dyn std::error::Error,
+                sid,
+                "smmu: accelerated CFGI_STE failed"
+            );
+        }
     }
 
     // =========================================================================

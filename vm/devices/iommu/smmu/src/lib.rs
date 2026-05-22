@@ -15,6 +15,7 @@ mod translate;
 
 pub use emulator::SmmuConfig;
 pub use emulator::SmmuDevice;
+pub use shared::AcceleratedStreamBackend;
 pub use shared::SmmuSharedState;
 pub use shared::SmmuSignalMsi;
 pub use shared::SmmuTranslator;
