@@ -266,6 +266,9 @@ pub struct IommuViommuAlloc {
     pub dev_id: u32,
     pub hwpt_id: u32,
     pub out_viommu_id: u32,
+    pub data_len: u32,
+    pub __reserved: u32,
+    pub data_uptr: u64,
 }
 
 // --- Virtual device ---
@@ -542,6 +545,9 @@ impl IommufdCtx {
             dev_id,
             hwpt_id,
             out_viommu_id: 0,
+            data_len: 0,
+            __reserved: 0,
+            data_uptr: 0,
         };
         // SAFETY: fd is valid, struct correctly constructed.
         unsafe {
