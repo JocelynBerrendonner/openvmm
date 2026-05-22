@@ -190,11 +190,32 @@ impl IommufdStreamBackend {
         (valid, config)
     }
 
+    // Nesting-allowed masks from the kernel's arm-smmu-v3.h.
+    // Only these STE fields are accepted by IOMMU_HWPT_ALLOC for nested
+    // domains; all other bits must be zero.
+    //
+    // DW0: V | CFG | S1FMT | S1CTXPTR | S1CDMAX
+    const STE0_NESTING_ALLOWED: u64 =
+        0xFFFF_FFFF_FFFF_FFFF; // all of DW0 is covered by allowed fields
+    // DW1: S1DSS | S1CIR | S1COR | S1CSH | S1STALLD | EATS
+    const STE1_NESTING_ALLOWED: u64 = {
+        let s1dss = 0x3; // bits [1:0]
+        let s1cir = 0x3 << 2; // bits [3:2]
+        let s1cor = 0x3 << 4; // bits [5:4]
+        let s1csh = 0x3 << 6; // bits [7:6]
+        let s1stalld = 1 << 27; // bit 27
+        let eats = 0x3 << 28; // bits [29:28]
+        s1dss | s1cir | s1cor | s1csh | s1stalld | eats
+    };
+
     /// Extract STE DW0 and DW1 (first 16 bytes) for nested HWPT allocation.
+    ///
+    /// Masks off bits that the kernel does not allow for nested domains
+    /// (e.g., SHCFG, STRW) to prevent EIO from `IOMMU_HWPT_ALLOC`.
     fn extract_ste_dwords(ste_bytes: &[u8; 64]) -> [u64; 2] {
         let dw0 = u64::from_le_bytes(ste_bytes[0..8].try_into().unwrap());
         let dw1 = u64::from_le_bytes(ste_bytes[8..16].try_into().unwrap());
-        [dw0, dw1]
+        [dw0 & Self::STE0_NESTING_ALLOWED, dw1 & Self::STE1_NESTING_ALLOWED]
     }
 
     /// Handle STE Config=ABORT: detach from any HWPT.
@@ -282,6 +303,13 @@ impl IommufdStreamBackend {
         // Extract STE DW0-1 for the nested HWPT allocation.
         let ste_dwords = Self::extract_ste_dwords(ste_bytes);
         let ste_data = vfio_sys::iommufd::IommuHwptArmSmmuv3 { ste: ste_dwords };
+
+        tracing::info!(
+            dev_id = self.dev_id,
+            ste_dw0 = format_args!("{:#018x}", ste_dwords[0]),
+            ste_dw1 = format_args!("{:#018x}", ste_dwords[1]),
+            "SMMU accel: allocating nested HWPT with STE data"
+        );
 
         // Allocate a new nested HWPT under the vIOMMU.
         let new_hwpt = self
