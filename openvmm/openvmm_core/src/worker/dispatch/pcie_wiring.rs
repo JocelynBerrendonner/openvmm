@@ -186,7 +186,9 @@ pub(super) fn build_device_wiring(params: PcieDeviceWiringParams<'_>) -> PcieDev
                 signal_msi: smmu_msi,
                 irqfd,
             },
-            software_iommu: true,
+            // Accel SMMUs allow VFIO devices (host IOMMU handles S1).
+            // Non-accel SMMUs block VFIO (software-only translation).
+            software_iommu: !shared.is_accel(),
         };
     }
 

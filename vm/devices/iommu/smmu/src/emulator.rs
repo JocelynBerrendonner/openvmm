@@ -37,8 +37,7 @@ pub struct SmmuConfig {
     /// Enable HW-accelerated nested S1 translation (iommufd).
     ///
     /// When true, VFIO cdev devices behind this SMMU use hardware-
-    /// accelerated translation and are not wrapped with software
-    /// `SmmuTranslatingMemory`. The SMMU still emulates registers
+    /// accelerated translation. The SMMU still emulates registers
     /// and dispatches CMDQ commands to iommufd backends.
     pub accel: bool,
 }

@@ -167,8 +167,7 @@ pub struct SmmuSharedState {
     /// Whether this SMMU is in accelerated mode (iommufd nested).
     ///
     /// When `true`, VFIO cdev devices behind this SMMU use hardware-
-    /// accelerated S1 translation and are not wrapped with software
-    /// `SmmuTranslatingMemory`. When `false`, all devices use the
+    /// accelerated S1 translation. When `false`, all devices use the
     /// software page table walk path.
     accel: bool,
     /// Per-device accelerated backends (VFIO devices with iommufd nested).

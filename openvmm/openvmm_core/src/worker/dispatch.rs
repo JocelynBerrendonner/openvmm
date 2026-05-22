@@ -2367,23 +2367,6 @@ impl InitializedVm {
 
                 let msi_conn = pci_core::msi::MsiConnection::new(pi.bus_range.clone(), 0);
 
-                // When a device is behind an accel-capable SMMU and is a
-                // VFIO cdev device (HW-accelerated S1), skip the software
-                // SMMU wrapping — the device's DMA goes through the host
-                // IOMMU via iommufd nested HWPTs, not through GuestMemory.
-                // Emulated devices on the same RC still get software wrapping.
-                #[cfg(guest_arch = "aarch64")]
-                let smmu_for_device = {
-                    let smmu = smmu_states[pi.rc_idx].as_ref();
-                    let is_accel = smmu.map_or(false, |s| s.is_accel());
-                    let is_cdev = dev_cfg.resource.id() == "vfio-cdev";
-                    if is_accel && is_cdev {
-                        None // Skip SMMU wrapping — HW handles translation
-                    } else {
-                        smmu
-                    }
-                };
-
                 let pcie_ctx =
                     pcie_wiring::build_device_wiring(pcie_wiring::PcieDeviceWiringParams {
                         msi_platform: pcie_wiring::PcieMsiPlatform {
@@ -2396,7 +2379,7 @@ impl InitializedVm {
                         guest_memory: gm,
                         bus_range: &pi.bus_range,
                         #[cfg(guest_arch = "aarch64")]
-                        smmu: smmu_for_device,
+                        smmu: smmu_states[pi.rc_idx].as_ref(),
                     });
 
                 vmm_core::device_builder::build_pcie_device(
