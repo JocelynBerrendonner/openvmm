@@ -232,6 +232,13 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
             port_name,
         } = resource;
 
+        if input.software_iommu {
+            anyhow::bail!(
+                "VFIO device {pci_id} is behind a software IOMMU that cannot \
+                 program the host IOMMU for passthrough DMA"
+            );
+        }
+
         // Check if this device is behind an accel-capable SMMU.
         let nesting_entry = self.nesting_store.get(&port_name);
         let needs_nesting = nesting_entry.is_some();
