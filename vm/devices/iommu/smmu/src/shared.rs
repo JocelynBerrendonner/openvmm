@@ -55,11 +55,14 @@ pub trait AcceleratedStreamBackend: Send + Sync {
     /// Guest wrote `CFGI_STE` for this stream. The 64-byte STE is read from
     /// guest memory by the caller.
     ///
+    /// `sid` is the stream ID from the CMDQ command, used for lazy vDevice
+    /// allocation (the virtual stream ID is not known at construction time).
+    ///
     /// The backend dispatches on `STE.Config`:
     /// - `ABORT` (0): detach from nested HWPT, attach abort HWPT
     /// - `BYPASS` (4): detach from nested HWPT, attach bypass HWPT
     /// - `S1_TRANS` (5): mask STE DW0-1, call `IOMMU_HWPT_ALLOC` nested
-    fn on_cfgi_ste(&self, ste_bytes: &[u8; 64]) -> anyhow::Result<()>;
+    fn on_cfgi_ste(&self, sid: u32, ste_bytes: &[u8; 64]) -> anyhow::Result<()>;
 
     /// Guest issued a TLBI command. The raw 16-byte command entry is
     /// forwarded to iommufd via `IOMMU_HWPT_INVALIDATE`. The kernel

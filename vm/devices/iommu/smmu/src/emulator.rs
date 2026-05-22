@@ -711,7 +711,7 @@ impl SmmuDevice {
             return;
         }
 
-        if let Err(e) = backend.on_cfgi_ste(&ste_bytes) {
+        if let Err(e) = backend.on_cfgi_ste(sid, &ste_bytes) {
             tracelimit::warn_ratelimited!(
                 error = &*e as &dyn std::error::Error,
                 sid,

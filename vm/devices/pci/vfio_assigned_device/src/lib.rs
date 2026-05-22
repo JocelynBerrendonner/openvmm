@@ -14,6 +14,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod iommufd_nesting;
 pub mod manager;
 pub mod resolver;
 

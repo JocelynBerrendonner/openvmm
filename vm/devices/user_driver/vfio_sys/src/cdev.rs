@@ -165,3 +165,47 @@ impl AsFd for CdevDevice {
         self.file.as_fd()
     }
 }
+
+/// Attach a VFIO cdev device to a page table (IOAS or HWPT) by its
+/// iommufd object ID.
+///
+/// This is a free-function variant for use when the [`CdevDevice`] has
+/// already been consumed by [`CdevDevice::into_device()`]. The fd must
+/// be a VFIO cdev device fd that has been bound to iommufd.
+///
+/// Returns the attached page table ID (may differ from input if the
+/// kernel auto-created a HWPT for an IOAS).
+pub fn attach_pt(device_fd: BorrowedFd<'_>, pt_id: u32) -> anyhow::Result<u32> {
+    let mut cmd = VfioDeviceAttachIommufdPt {
+        argsz: size_of::<VfioDeviceAttachIommufdPt>() as u32,
+        flags: 0,
+        pt_id,
+    };
+    // SAFETY: fd is valid (caller holds BorrowedFd), struct correctly
+    // constructed.
+    unsafe {
+        ioctl::vfio_device_attach_iommufd_pt(device_fd.as_raw_fd(), &mut cmd)
+            .context("VFIO_DEVICE_ATTACH_IOMMUFD_PT failed")?;
+    }
+    Ok(cmd.pt_id)
+}
+
+/// Detach a VFIO cdev device from its current page table.
+///
+/// After detaching, the device is in a blocking DMA state (abort).
+///
+/// This is a free-function variant for use when the [`CdevDevice`] has
+/// already been consumed by [`CdevDevice::into_device()`].
+pub fn detach_pt(device_fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+    let mut cmd = VfioDeviceDetachIommufdPt {
+        argsz: size_of::<VfioDeviceDetachIommufdPt>() as u32,
+        flags: 0,
+    };
+    // SAFETY: fd is valid (caller holds BorrowedFd), struct correctly
+    // constructed.
+    unsafe {
+        ioctl::vfio_device_detach_iommufd_pt(device_fd.as_raw_fd(), &mut cmd)
+            .context("VFIO_DEVICE_DETACH_IOMMUFD_PT failed")?;
+    }
+    Ok(())
+}
