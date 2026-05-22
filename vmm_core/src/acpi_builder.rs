@@ -742,20 +742,14 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
             let mapping_count = 1u32;
             let rmr = iort::IortRmr::new(
                 cfg_idx as u32 + 0x1000, // unique identifier
-                iort::IORT_RMR_ACCESS_PRIVILEGE,
+                0,                       // flags: no ACCESS_PRIVILEGE, no REMAP_PERMITTED
                 rmr_count,
                 mapping_count,
             );
             iort_extra.extend_from_slice(rmr.as_bytes());
 
-            // RMR descriptors.
-            for &(start, last) in &cfg.reserved_iova_ranges {
-                let length = last - start + 1;
-                iort_extra
-                    .extend_from_slice(iort::IortRmrDescriptor::new(start, length).as_bytes());
-            }
-
-            // ID mapping: full BDF range → SMMUv3 node.
+            // ID mapping first (must come before RMR descriptors to match
+            // the offset layout in IortRmr::new).
             iort_extra.extend_from_slice(
                 iort::IortIdMapping::new(
                     0,           // input_base
@@ -766,6 +760,13 @@ impl<T: AcpiTopology> AcpiTablesBuilder<'_, T> {
                 )
                 .as_bytes(),
             );
+
+            // RMR descriptors.
+            for &(start, last) in &cfg.reserved_iova_ranges {
+                let length = last - start + 1;
+                iort_extra
+                    .extend_from_slice(iort::IortRmrDescriptor::new(start, length).as_bytes());
+            }
         }
 
         (f)(&acpi::builder::Table::new_dyn(

@@ -305,7 +305,7 @@ const_assert_eq!(size_of::<IortSmmuV3>(), 68);
 
 // --- RMR (Reserved Memory Range) node (IORT spec DEN0049E §E.5) ---
 
-pub const IORT_RMR_REVISION: u8 = 2;
+pub const IORT_RMR_REVISION: u8 = 3;
 
 /// RMR flags: access privilege hint. When set, the OS may map the region
 /// with elevated privileges (e.g., supervisor mode).
@@ -336,20 +336,19 @@ impl IortRmr {
             identifier,
             mapping_count,
         );
-        // Total size: fixed header + RMR descriptors + ID mappings.
+        // Total size: fixed header + ID mappings + RMR descriptors.
         let total = size_of::<Self>() as u16
-            + (rmr_count as u16) * size_of::<IortRmrDescriptor>() as u16
-            + (mapping_count as u16) * size_of::<IortIdMapping>() as u16;
+            + (mapping_count as u16) * size_of::<IortIdMapping>() as u16
+            + (rmr_count as u16) * size_of::<IortRmrDescriptor>() as u16;
         header.length = total.into();
-        // mapping_offset comes after the RMR descriptors.
+        // mapping_offset is immediately after the fixed header.
         if mapping_count > 0 {
-            header.mapping_offset = (size_of::<Self>() as u32
-                + rmr_count * size_of::<IortRmrDescriptor>() as u32)
-                .into();
+            header.mapping_offset = (size_of::<Self>() as u32).into();
         }
-        // rmr_offset is immediately after the fixed header.
+        // rmr_offset comes after the ID mappings.
         let rmr_offset = if rmr_count > 0 {
             size_of::<Self>() as u32
+                + mapping_count * size_of::<IortIdMapping>() as u32
         } else {
             0
         };

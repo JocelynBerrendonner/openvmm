@@ -162,12 +162,22 @@ pub fn lookup_cd(
         s1_context_ptr.wrapping_add((ssid as u64) * (crate::spec::cd::CD_SIZE as u64)) & oas_mask;
     let cd: Cd = gm.read_plain(cd_addr).map_err(|_| SmmuFault::bad_cd(sid))?;
 
+    tracelimit::info_ratelimited!(
+        sid,
+        cd_addr = format_args!("{:#x}", cd_addr),
+        cd_dw0 = format_args!("{:#018x}", u64::from(cd.qw0)),
+        cd_dw1 = format_args!("{:#018x}", u64::from(cd.qw1)),
+        "lookup_cd: read CD from guest memory"
+    );
+
     if !cd.valid() {
+        tracelimit::warn_ratelimited!(sid, cd_addr = format_args!("{:#x}", cd_addr), "lookup_cd: CD not valid");
         return Err(SmmuFault::bad_cd(sid));
     }
 
     // Only AArch64 page tables are supported.
     if !cd.aa64() {
+        tracelimit::warn_ratelimited!(sid, "lookup_cd: CD not AA64");
         return Err(SmmuFault::bad_cd(sid));
     }
 
@@ -175,6 +185,7 @@ pub fn lookup_cd(
     // (no stall) and TERM_MODEL=1 (terminate on fault), an access flag
     // fault would be unrecoverable, so the guest must pre-set A=1.
     if !cd.qw0.a() {
+        tracelimit::warn_ratelimited!(sid, "lookup_cd: CD.A not set (TERM_MODEL=1 requires A=1)");
         return Err(SmmuFault::bad_cd(sid));
     }
 
