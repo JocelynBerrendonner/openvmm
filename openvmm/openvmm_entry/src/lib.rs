@@ -1576,6 +1576,18 @@ async fn vm_config_from_command_line(
     }
 
     #[cfg(guest_arch = "aarch64")]
+    let smmu_instances: Vec<openvmm_defs::config::SmmuInstanceConfig> = opt
+        .smmu
+        .iter()
+        .map(|s| openvmm_defs::config::SmmuInstanceConfig {
+            rc_name: s.rc_name.clone(),
+            accel: s.accel,
+            ats: s.ats,
+            ssidsize: s.ssidsize,
+        })
+        .collect();
+
+    #[cfg(guest_arch = "aarch64")]
     let topology_arch = openvmm_defs::config::ArchTopologyConfig::Aarch64(
         openvmm_defs::config::Aarch64TopologyConfig {
             // TODO: allow this to be configured from the command line

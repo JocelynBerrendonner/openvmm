@@ -569,10 +569,13 @@ options:
     #[clap(long, default_value = "auto")]
     pub gic_msi: GicMsiCli,
 
-    /// enable SMMUv3 IOMMU for an aarch64 PCIe root complex (repeatable, e.g. --smmu rc0 --smmu rc1)
+    /// configure SMMUv3 IOMMU for an aarch64 PCIe root complex (repeatable).
+    ///
+    /// Syntax: `rc=<name>[,accel][,ats][,ssidsize=N]` or plain `<name>`
+    /// as shorthand for `rc=<name>`.
     #[cfg(guest_arch = "aarch64")]
-    #[clap(long, value_name = "RC_NAME")]
-    pub smmu: Vec<String>,
+    #[clap(long, value_name = "SMMU_CONFIG")]
+    pub smmu: Vec<SmmuCli>,
 
     /// COM1 binding (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
     #[clap(long, value_name = "SERIAL")]
@@ -3479,6 +3482,94 @@ impl FromStr for VfioDeviceCli {
             pci_id,
             iommu,
             bar_pt,
+        })
+    }
+}
+
+/// CLI configuration for an SMMUv3 instance.
+///
+/// Syntax: `rc=<name>[,accel][,ats][,ssidsize=N]` or plain `<name>`
+/// as shorthand for `rc=<name>`.
+#[cfg(guest_arch = "aarch64")]
+#[derive(Clone, Debug)]
+pub struct SmmuCli {
+    /// Name of the PCIe root complex this SMMU covers.
+    pub rc_name: String,
+    /// Enable HW-accelerated nested translation (iommufd).
+    pub accel: bool,
+    /// Enable ATS (Address Translation Services). Requires `accel`.
+    pub ats: bool,
+    /// Number of SSID bits (0–20). >0 requires `accel`.
+    pub ssidsize: u8,
+}
+
+#[cfg(guest_arch = "aarch64")]
+impl FromStr for SmmuCli {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Check if this is a bare RC name (no '=' or ',' means shorthand).
+        if !s.contains('=') && !s.contains(',') {
+            return Ok(SmmuCli {
+                rc_name: s.to_string(),
+                accel: false,
+                ats: false,
+                ssidsize: 0,
+            });
+        }
+
+        let mut rc_name: Option<String> = None;
+        let mut accel = false;
+        let mut ats = false;
+        let mut ssidsize: u8 = 0;
+
+        for part in s.split(',') {
+            if let Some((key, value)) = part.split_once('=') {
+                match key {
+                    "rc" => {
+                        if rc_name.is_some() {
+                            anyhow::bail!("duplicate --smmu key: 'rc'");
+                        }
+                        if value.is_empty() {
+                            anyhow::bail!("--smmu: 'rc=' value cannot be empty");
+                        }
+                        rc_name = Some(value.to_string());
+                    }
+                    "ssidsize" => {
+                        let n: u8 = value
+                            .parse()
+                            .context("--smmu: ssidsize must be a number 0-20")?;
+                        if n > 20 {
+                            anyhow::bail!("--smmu: ssidsize must be 0-20, got {n}");
+                        }
+                        ssidsize = n;
+                    }
+                    _ => anyhow::bail!("unknown --smmu key: '{key}'"),
+                }
+            } else {
+                // Boolean flag (no '=')
+                match part {
+                    "accel" => accel = true,
+                    "ats" => ats = true,
+                    _ => anyhow::bail!("unknown --smmu flag: '{part}'"),
+                }
+            }
+        }
+
+        let rc_name = rc_name.context("--smmu: 'rc=' is required")?;
+
+        if ats && !accel {
+            anyhow::bail!("--smmu: 'ats' requires 'accel'");
+        }
+        if ssidsize > 0 && !accel {
+            anyhow::bail!("--smmu: 'ssidsize>0' requires 'accel'");
+        }
+
+        Ok(SmmuCli {
+            rc_name,
+            accel,
+            ats,
+            ssidsize,
         })
     }
 }

@@ -582,9 +582,7 @@ impl SmmuDevice {
                 // Configuration invalidation: CFGI_CD — no-op for emulated devices.
                 // For accelerated streams, CD invalidation is handled by the
                 // kernel when it re-reads the CD table via the STE's S1ContextPtr.
-                CmdOpcode::PREFETCH_CFG
-                | CmdOpcode::CFGI_CD
-                | CmdOpcode::CFGI_CD_ALL => {}
+                CmdOpcode::PREFETCH_CFG | CmdOpcode::CFGI_CD | CmdOpcode::CFGI_CD_ALL => {}
 
                 // TLB invalidation commands — forward to all accelerated backends.
                 CmdOpcode::TLBI_NH_ALL
@@ -689,11 +687,7 @@ impl SmmuDevice {
 
     /// Read the STE for `sid` from guest memory and forward to the
     /// accelerated backend.
-    fn dispatch_cfgi_ste(
-        &self,
-        sid: u32,
-        backend: &dyn crate::shared::AcceleratedStreamBackend,
-    ) {
+    fn dispatch_cfgi_ste(&self, sid: u32, backend: &dyn crate::shared::AcceleratedStreamBackend) {
         let (strtab_base, strtab_log2size) = self.shared_state.strtab_config();
         let max_streams = 1u64 << strtab_log2size;
         if (sid as u64) >= max_streams {

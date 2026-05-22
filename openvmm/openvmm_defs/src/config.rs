@@ -366,6 +366,24 @@ pub enum PcieIommuConfig {
     Smmu,
 }
 
+/// Per-instance SMMUv3 configuration for an aarch64 VM.
+///
+/// Each instance covers one PCIe root complex, identified by name.
+/// The SMMU's MMIO address is allocated dynamically by the memory layout
+/// engine.
+#[derive(Debug, Protobuf, Clone)]
+pub struct SmmuInstanceConfig {
+    /// Name of the PCIe root complex this SMMU covers.
+    pub rc_name: String,
+    /// Enable HW-accelerated nested translation (iommufd). Requires VFIO
+    /// devices with `iommu=` behind this SMMU.
+    pub accel: bool,
+    /// Enable ATS (Address Translation Services). Requires `accel`.
+    pub ats: bool,
+    /// Number of SSID (SubStream ID / PASID) bits, 0–20. >0 requires `accel`.
+    pub ssidsize: u8,
+}
+
 #[derive(Debug, Protobuf, Default, Clone)]
 pub struct Aarch64TopologyConfig {
     pub gic_config: Option<GicConfig>,
