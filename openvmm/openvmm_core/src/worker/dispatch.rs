@@ -2314,6 +2314,21 @@ impl InitializedVm {
             .connect_to(&deferred.msi_conn);
         }
 
+        // Mark root complexes with IORT RMR entries so the SSDT emits a
+        // PCI Firmware _DSM (function 5, preserve boot config). Linux
+        // skips RMR entries for root complexes without this flag.
+        #[cfg(guest_arch = "aarch64")]
+        for smmu_cfg in &smmu_configs {
+            if !smmu_cfg.reserved_iova_ranges.is_empty() {
+                if let Some(bridge) = pcie_host_bridges
+                    .iter_mut()
+                    .find(|b| b.index == smmu_cfg.rc_index)
+                {
+                    bridge.preserve_boot_config = true;
+                }
+            }
+        }
+
         // Resolve PCIe devices concurrently.
         //
         // When ITS is active, the root complex's ITS-wrapped SignalMsi
