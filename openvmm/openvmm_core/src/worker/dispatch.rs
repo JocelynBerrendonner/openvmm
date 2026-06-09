@@ -1947,6 +1947,7 @@ impl InitializedVm {
         }
         let mut deferred_msi_conns: Vec<DeferredMsiConn> = Vec::new();
 
+        #[cfg_attr(not(guest_arch = "aarch64"), expect(unused_mut))]
         let (mut pcie_host_bridges, pcie_root_complexes) = {
             let mut pcie_host_bridges = Vec::new();
             let mut pcie_root_complexes = Vec::new();
