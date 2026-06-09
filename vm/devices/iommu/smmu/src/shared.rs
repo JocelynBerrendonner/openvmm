@@ -32,7 +32,6 @@ use parking_lot::RwLock;
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::SignalMsi;
 use std::fmt;
-use std::ptr::NonNull;
 use std::sync::Arc;
 use vmcore::irqfd::IrqFd;
 use vmcore::irqfd::IrqFdRoute;
