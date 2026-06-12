@@ -582,12 +582,10 @@ impl SmmuDevice {
                     // For other ranges, we'd need to iterate the SID range,
                     // but Range=31 is the only value Linux uses at init.
                     // For now, treat all ranges as broadcast to all backends.
-                    let backends = self.shared_state.all_stream_backends();
-                    if !backends.is_empty() {
-                        // For CFGI_ALL, re-read each backend's STE.
-                        for (sid, backend) in self.shared_state.stream_backend_entries() {
-                            self.dispatch_cfgi_ste(sid, &*backend);
-                        }
+                    // For CFGI_ALL, re-read each backend's STE. Empty for
+                    // emulated-only configurations (loop is a no-op).
+                    for (sid, backend) in self.shared_state.stream_backend_entries() {
+                        self.dispatch_cfgi_ste(sid, &*backend);
                     }
                 }
 
@@ -603,21 +601,19 @@ impl SmmuDevice {
                 | CmdOpcode::TLBI_NH_VAA
                 | CmdOpcode::TLBI_S12_VMALL
                 | CmdOpcode::TLBI_NSNH_ALL => {
-                    let backends = self.shared_state.all_stream_backends();
-                    if !backends.is_empty() {
-                        let cmd_bytes: [u8; 16] = {
-                            let mut buf = [0u8; 16];
-                            buf[..8].copy_from_slice(&entry.qw0.to_le_bytes());
-                            buf[8..].copy_from_slice(&entry.qw1.to_le_bytes());
-                            buf
-                        };
-                        for backend in &backends {
-                            if let Err(e) = backend.on_tlbi(&cmd_bytes) {
-                                tracelimit::warn_ratelimited!(
-                                    error = &*e as &dyn std::error::Error,
-                                    "smmu: accelerated TLBI failed"
-                                );
-                            }
+                    let cmd_bytes: [u8; 16] = {
+                        let mut buf = [0u8; 16];
+                        buf[..8].copy_from_slice(&entry.qw0.to_le_bytes());
+                        buf[8..].copy_from_slice(&entry.qw1.to_le_bytes());
+                        buf
+                    };
+                    // Empty for emulated-only configurations (no-op).
+                    for backend in self.shared_state.all_stream_backends() {
+                        if let Err(e) = backend.on_tlbi(&cmd_bytes) {
+                            tracelimit::warn_ratelimited!(
+                                error = &*e as &dyn std::error::Error,
+                                "smmu: accelerated TLBI failed"
+                            );
                         }
                     }
                     // Emulated devices: no-op (no TLB cache).

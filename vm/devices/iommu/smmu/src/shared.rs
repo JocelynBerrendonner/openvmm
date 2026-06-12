@@ -31,7 +31,6 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::SignalMsi;
-use std::fmt;
 use std::sync::Arc;
 use vmcore::irqfd::IrqFd;
 use vmcore::irqfd::IrqFdRoute;
@@ -109,25 +108,6 @@ fn compose_stream_id(
     }
     Some(stream_id_base + (bdf & 0xFFFF))
 }
-
-/// Translation error for SMMU DMA access.
-#[derive(Debug)]
-struct SmmuTranslationError {
-    iova: u64,
-    msg: &'static str,
-}
-
-impl fmt::Display for SmmuTranslationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "SMMU translation failed: {} at IOVA {:#x}",
-            self.msg, self.iova
-        )
-    }
-}
-
-impl std::error::Error for SmmuTranslationError {}
 
 /// Result of an SMMU translation attempt.
 #[derive(Debug)]
