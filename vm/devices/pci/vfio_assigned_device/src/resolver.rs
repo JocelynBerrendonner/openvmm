@@ -128,19 +128,24 @@ pub struct VfioCdevDeviceResolver {
 ///
 /// Populated by dispatch.rs after SMMU setup, before device resolution.
 /// The resolver reads from this store during device resolution to determine
-/// whether a VFIO cdev device should use iommufd nested translation.
+/// whether a VFIO cdev device should use iommufd nested translation, and to
+/// find the emulated SMMU it must be wired into.
 pub struct SmmuNestingStore {
+    /// Per-port nesting entries.
     entries: RwLock<HashMap<String, SmmuNestingEntry>>,
 }
 
 /// Per-port SMMU nesting context.
-pub struct SmmuNestingEntry {
+struct SmmuNestingEntry {
+    /// SMMU id (root complex index); identifies the emulated SMMU so the
+    /// manager can share one vIOMMU across all of its ports.
+    smmu_id: usize,
     /// SMMU shared state for the root complex this port belongs to.
-    pub smmu_shared: Arc<smmu::SmmuSharedState>,
+    smmu_shared: Arc<smmu::SmmuSharedState>,
     /// The device's assigned bus range (shared with the PCIe port).
-    pub bus_range: AssignedBusRange,
+    bus_range: AssignedBusRange,
     /// Offset into the SMMU's stream table (0 for 1:1 SMMU-per-RC).
-    pub stream_id_base: u32,
+    stream_id_base: u32,
 }
 
 impl SmmuNestingStore {
@@ -152,9 +157,13 @@ impl SmmuNestingStore {
     }
 
     /// Register a port for SMMU nesting.
+    ///
+    /// `smmu_id` identifies the emulated SMMU (root complex index); all ports
+    /// sharing it share a single vIOMMU (allocated by the manager).
     pub fn register(
         &self,
         port_name: String,
+        smmu_id: usize,
         smmu_shared: Arc<smmu::SmmuSharedState>,
         bus_range: AssignedBusRange,
         stream_id_base: u32,
@@ -162,6 +171,7 @@ impl SmmuNestingStore {
         self.entries.write().insert(
             port_name,
             SmmuNestingEntry {
+                smmu_id,
                 smmu_shared,
                 bus_range,
                 stream_id_base,
@@ -173,6 +183,7 @@ impl SmmuNestingStore {
     fn get(&self, port_name: &str) -> Option<SmmuNestingEntryRef> {
         let entries = self.entries.read();
         entries.get(port_name).map(|e| SmmuNestingEntryRef {
+            smmu_id: e.smmu_id,
             smmu_shared: e.smmu_shared.clone(),
             bus_range: e.bus_range.clone(),
             stream_id_base: e.stream_id_base,
@@ -182,6 +193,7 @@ impl SmmuNestingStore {
 
 /// Cloned reference to a nesting entry (avoids holding the lock).
 struct SmmuNestingEntryRef {
+    smmu_id: usize,
     smmu_shared: Arc<smmu::SmmuSharedState>,
     bus_range: AssignedBusRange,
     stream_id_base: u32,
@@ -241,59 +253,44 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
 
         // Check if this device is behind an accel-capable SMMU.
         let nesting_entry = self.nesting_store.get(&port_name);
-        let needs_nesting = nesting_entry.is_some();
 
         tracing::info!(
             pci_id,
             iommu_id,
             port_name,
-            needs_nesting,
+            needs_nesting = nesting_entry.is_some(),
             "opening VFIO cdev device with iommufd"
         );
 
-        let resp = self
+        let mut resp = self
             .client
             .prepare_device(crate::manager::CdevPrepareRequest {
                 pci_id: pci_id.clone(),
                 cdev,
                 iommufd,
                 iommu_id,
-                needs_nesting,
+                smmu_id: nesting_entry.as_ref().map(|e| e.smmu_id),
             })
             .await
             .context("VFIO cdev manager failed")?;
 
-        // If nesting, create the iommufd nesting backend and register
-        // it with the SMMU shared state.
-        if let (Some(entry), Some(nesting_ctx)) = (nesting_entry, &resp.nesting_ctx) {
+        // If the device is nested, wire the manager's iommufd objects into
+        // the emulated SMMU: finalize host-derived parameters and register
+        // the per-device stream backend. The manager already created (or
+        // reused) the shared vIOMMU and queried host capabilities.
+        if let (Some(entry), Some(nesting)) = (nesting_entry, resp.nesting.take()) {
             // Finalize the vSMMU's host-derived parameters (OAS, ...) against
             // the physical SMMU backing this device. Runs once per vSMMU; a
             // later device on a different physical SMMU is rejected here.
-            let host_caps = crate::iommufd_nesting::query_host_caps(
-                &nesting_ctx.iommufd_ctx,
-                resp.iommufd_devid,
-            )
-            .with_context(|| format!("failed to query host SMMU caps for device {pci_id}"))?;
-
             entry
                 .smmu_shared
-                .resolve_host_caps(host_caps)
+                .resolve_host_caps(nesting.host_caps)
                 .with_context(|| format!("device {pci_id} is incompatible with the host SMMU"))?;
 
-            let accel_state = crate::iommufd_nesting::SmmuAccelState::new(
-                nesting_ctx.iommufd_ctx.clone(),
-                resp.iommufd_devid,
-                nesting_ctx.s2_parent_hwpt_id,
-            )
-            .with_context(|| format!("failed to create SMMU accel state for device {pci_id}"))?;
-
             let backend = Arc::new(crate::iommufd_nesting::IommufdStreamBackend::new(
-                Arc::new(accel_state),
+                nesting.accel_state,
                 resp.iommufd_devid,
-                nesting_ctx
-                    .device_cdev_fd
-                    .try_clone()
-                    .context("failed to dup cdev fd for stream backend")?,
+                nesting.device_cdev_fd,
             ));
 
             entry.smmu_shared.register_accel_device(

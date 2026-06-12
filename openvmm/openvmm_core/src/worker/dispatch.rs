@@ -2357,6 +2357,7 @@ impl InitializedVm {
                 if smmu_shared.is_accel() {
                     nesting_store.register(
                         port_name.to_string(),
+                        pi.rc_idx, // SMMU id: one vIOMMU per root complex
                         smmu_shared.clone(),
                         pi.bus_range.clone(),
                         0, // stream_id_base = 0 for 1:1 SMMU-per-RC
