@@ -45,9 +45,10 @@ use vfio_sys::iommufd::IommufdCtx;
 
 /// Query the physical SMMUv3's capabilities for a device bound to iommufd.
 ///
-/// Issues a single `IOMMU_GET_HW_INFO` and decodes the fields the vSMMU
-/// finalizes against the host (currently IDR5.OAS). Handed to
-/// [`smmu::SmmuSharedState::resolve_host_caps`].
+/// Issues a single `IOMMU_GET_HW_INFO` and hands the host's raw IDR registers
+/// to [`smmu::HostSmmuCaps::from_idr`], which decodes the fields the vSMMU
+/// finalizes against and validates compatibility with (OAS, TTF, TTENDIAN,
+/// GRAN4K).
 pub fn query_host_caps(ctx: &IommufdCtx, dev_id: u32) -> anyhow::Result<smmu::HostSmmuCaps> {
     let mut info = vfio_sys::iommufd::IommuHwInfoArmSmmuv3 {
         flags: 0,
@@ -66,11 +67,7 @@ pub fn query_host_caps(ctx: &IommufdCtx, dev_id: u32) -> anyhow::Result<smmu::Ho
     if data_type != vfio_sys::iommufd::IOMMU_HW_INFO_TYPE_ARM_SMMUV3 {
         anyhow::bail!("unexpected host IOMMU hw info type {data_type} (expected ARM SMMUv3)");
     }
-    // IDR5.OAS is the low 3 bits of IDR5 (idr[5]).
-    let oas_enc = (info.idr[5] & 0x7) as u8;
-    let oas_bits = smmu::oas_bits_from_encoding(oas_enc)
-        .with_context(|| format!("host SMMUv3 reported unknown OAS encoding {oas_enc}"))?;
-    Ok(smmu::HostSmmuCaps { oas_bits })
+    Ok(smmu::HostSmmuCaps::from_idr(info.idr))
 }
 
 /// Per-SMMU iommufd objects for HW-accelerated nested translation.

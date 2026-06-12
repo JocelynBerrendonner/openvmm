@@ -326,15 +326,28 @@ impl SmmuSharedState {
     }
 
     /// Finalizes the host-derived vSMMU parameters against the physical SMMU
-    /// backing an accelerated device.
+    /// backing an accelerated device, and validates host/guest compatibility.
     ///
     /// Called when an accelerated VFIO device binds to iommufd, at which
     /// point the backing physical SMMU is first known. Runs once per vSMMU:
-    /// the first device applies every host-derived parameter according to its
-    /// configured policy (currently OAS — `auto` adopts the host value;
-    /// `fixed` is validated as an upper bound). Subsequent devices must report
-    /// identical host caps; a mismatch is rejected, since a single vSMMU
-    /// cannot be backed by two different physical SMMUs.
+    /// the first device validates compatibility (TTF, TTENDIAN, GRAN4K) and
+    /// applies every host-derived parameter according to its configured
+    /// policy (currently OAS — `auto` adopts the host value; `fixed` is
+    /// validated as an upper bound). Subsequent devices must report identical
+    /// host caps; a mismatch is rejected, since a single vSMMU cannot be
+    /// backed by two different physical SMMUs.
+    ///
+    /// The compatibility checks cover only the features this emulator
+    /// actually advertises that the host hardware must honor when walking the
+    /// guest's page tables. Features the emulator does not advertise
+    /// (SSIDSIZE, ATS, RIL, 16K/64K granules, 2-level stream tables) are
+    /// intentionally not checked — see the TODOs at the IDR advertisement in
+    /// `emulator.rs`. The host stream-ID size (IDR1.SIDSIZE) and stream-table
+    /// format (IDR0.ST_LEVEL) are deliberately *not* validated: in the nested
+    /// path the host never indexes or walks the guest's stream table (the VMM
+    /// emulates it and registers each guest StreamID individually via
+    /// `IOMMU_VDEVICE_ALLOC`), so the host and guest stream-table parameters
+    /// are independent.
     pub fn resolve_host_caps(&self, caps: crate::HostSmmuCaps) -> anyhow::Result<()> {
         let mut inner = self.inner.write();
 
@@ -349,18 +362,55 @@ impl SmmuSharedState {
             return Ok(());
         }
 
-        // OAS: `auto` adopts the host value; `fixed` must not exceed it.
+        // TTF: the emulator builds AArch64 S1 page tables, so the host must be
+        // able to walk them. TTF is a bitfield, not an ordered value — test
+        // the AArch64 bit rather than comparing.
+        if !caps.ttf.aarch64() {
+            anyhow::bail!(
+                "host SMMU does not support AArch64 translation tables \
+                 (IDR0.TTF={:#05b})",
+                u8::from(caps.ttf)
+            );
+        }
+
+        // TTENDIAN: the emulator uses little-endian table walks. The encoding
+        // is a set of distinct configurations, not an ordered range — test
+        // membership rather than comparing.
+        if !matches!(
+            caps.ttendian,
+            registers::Idr0TtEndian::MIXED | registers::Idr0TtEndian::LE
+        ) {
+            anyhow::bail!(
+                "host SMMU does not support little-endian translation tables \
+                 (IDR0.TTENDIAN={:#04b})",
+                caps.ttendian.0
+            );
+        }
+
+        // GRAN4K: the guest builds 4KB S1 page tables, so the host hardware
+        // must support the 4KB granule.
+        if !caps.gran4k {
+            anyhow::bail!("host SMMU does not support the 4KB translation granule (IDR5.GRAN4K=0)");
+        }
+
+        // OAS: decode the host's IDR5.OAS encoding (may be a reserved value),
+        // then `auto` adopts the host value while `fixed` must not exceed it.
+        let host_oas_bits = caps.oas.bits().ok_or_else(|| {
+            anyhow::anyhow!(
+                "host SMMU reported an unknown OAS encoding ({})",
+                caps.oas.0
+            )
+        })?;
         match self.oas_policy {
             crate::SmmuOasPolicy::Auto => {
-                inner.oas_bits = caps.oas_bits;
-                inner.oas_mask = (1u64 << caps.oas_bits) - 1;
+                inner.oas_bits = host_oas_bits;
+                inner.oas_mask = (1u64 << host_oas_bits) - 1;
             }
             crate::SmmuOasPolicy::Fixed(oas) => {
-                if oas > caps.oas_bits {
+                if oas > host_oas_bits {
                     anyhow::bail!(
-                        "configured SMMU oas={oas} exceeds host SMMU OAS {}; \
-                         lower the configured OAS or use oas=auto",
-                        caps.oas_bits
+                        "configured SMMU oas={oas} exceeds host SMMU OAS {host_oas_bits}; \
+                         lower the configured OAS or use oas=auto"
                     );
                 }
             }
@@ -1657,5 +1707,136 @@ mod tests {
         let calls = mock_msi.take_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (Some(rid), 0xFEE0_0000, 0x99));
+    }
+
+    // =========================================================================
+    // resolve_host_caps (accel host/guest compatibility) tests
+    // =========================================================================
+
+    /// A `HostSmmuCaps` that is compatible with everything the emulator
+    /// advertises (AArch64, little-endian, 4K granule, ample OAS).
+    fn compatible_host_caps() -> crate::HostSmmuCaps {
+        crate::HostSmmuCaps {
+            oas: Ips::IPS_48,
+            ttf: registers::Idr0Ttf::new().with_aarch64(true),
+            ttendian: registers::Idr0TtEndian::LE,
+            gran4k: true,
+        }
+    }
+
+    /// An accel-mode shared state with the given OAS policy.
+    fn make_accel_state(policy: crate::SmmuOasPolicy) -> Arc<SmmuSharedState> {
+        let gm = GuestMemory::allocate(0x1000);
+        SmmuSharedState::new(gm, 40, policy, true, None, None)
+    }
+
+    #[test]
+    fn resolve_host_caps_accepts_compatible_host() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        state.resolve_host_caps(compatible_host_caps()).unwrap();
+    }
+
+    #[test]
+    fn resolve_host_caps_auto_adopts_host_oas() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Auto);
+        let caps = crate::HostSmmuCaps {
+            oas: Ips::IPS_48,
+            ..compatible_host_caps()
+        };
+        state.resolve_host_caps(caps).unwrap();
+        assert_eq!(state.oas_bits(), 48);
+    }
+
+    #[test]
+    fn resolve_host_caps_rejects_fixed_oas_above_host() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(52));
+        let caps = crate::HostSmmuCaps {
+            oas: Ips::IPS_44,
+            ..compatible_host_caps()
+        };
+        let err = state.resolve_host_caps(caps).unwrap_err().to_string();
+        assert!(err.contains("exceeds host SMMU OAS"), "{err}");
+    }
+
+    #[test]
+    fn resolve_host_caps_rejects_no_aarch64() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        // AArch32-only host (TTF bit for AArch64 not set).
+        let caps = crate::HostSmmuCaps {
+            ttf: registers::Idr0Ttf::new().with_aarch32(true),
+            ..compatible_host_caps()
+        };
+        let err = state.resolve_host_caps(caps).unwrap_err().to_string();
+        assert!(err.contains("AArch64"), "{err}");
+    }
+
+    #[test]
+    fn resolve_host_caps_accepts_aarch32_and_aarch64_host() {
+        // A host advertising both formats supports AArch64 — must be accepted.
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        let caps = crate::HostSmmuCaps {
+            ttf: registers::Idr0Ttf::new()
+                .with_aarch32(true)
+                .with_aarch64(true),
+            ..compatible_host_caps()
+        };
+        state.resolve_host_caps(caps).unwrap();
+    }
+
+    #[test]
+    fn resolve_host_caps_rejects_big_endian_only_host() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        let caps = crate::HostSmmuCaps {
+            ttendian: registers::Idr0TtEndian::BE,
+            ..compatible_host_caps()
+        };
+        let err = state.resolve_host_caps(caps).unwrap_err().to_string();
+        assert!(err.contains("little-endian"), "{err}");
+    }
+
+    #[test]
+    fn resolve_host_caps_accepts_mixed_endian_host() {
+        // Mixed-endian host supports little-endian — must be accepted.
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        let caps = crate::HostSmmuCaps {
+            ttendian: registers::Idr0TtEndian::MIXED,
+            ..compatible_host_caps()
+        };
+        state.resolve_host_caps(caps).unwrap();
+    }
+
+    #[test]
+    fn resolve_host_caps_rejects_no_gran4k() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        let caps = crate::HostSmmuCaps {
+            gran4k: false,
+            ..compatible_host_caps()
+        };
+        let err = state.resolve_host_caps(caps).unwrap_err().to_string();
+        assert!(err.contains("4KB translation granule"), "{err}");
+    }
+
+    #[test]
+    fn resolve_host_caps_rejects_second_device_with_different_caps() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        state.resolve_host_caps(compatible_host_caps()).unwrap();
+        // A second device backed by a different physical SMMU (different OAS).
+        let other = crate::HostSmmuCaps {
+            oas: Ips::IPS_44,
+            ..compatible_host_caps()
+        };
+        let err = state.resolve_host_caps(other).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be backed by two physical SMMUs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_host_caps_accepts_second_device_with_identical_caps() {
+        let state = make_accel_state(crate::SmmuOasPolicy::Fixed(40));
+        state.resolve_host_caps(compatible_host_caps()).unwrap();
+        // Same caps again (another device behind the same physical SMMU).
+        state.resolve_host_caps(compatible_host_caps()).unwrap();
     }
 }

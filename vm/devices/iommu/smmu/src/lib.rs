@@ -38,9 +38,3 @@ pub fn min_oas_bits_for(max_addr: u64) -> u8 {
     }
     52
 }
-
-/// Converts an SMMUv3 IDR5.OAS field encoding to a size in bits, or `None`
-/// if the encoding is not recognized.
-pub fn oas_bits_from_encoding(encoding: u8) -> Option<u8> {
-    spec::cd::Ips(encoding).bits()
-}

@@ -47,15 +47,47 @@ pub enum SmmuOasPolicy {
 
 /// Capabilities of the physical SMMUv3 backing an accelerated vSMMU.
 ///
-/// Decoded from `IOMMU_GET_HW_INFO` by the VFIO layer and handed to
+/// Decoded from a host SMMUv3's `IDR0..IDR5` register values (as returned by
+/// `IOMMU_GET_HW_INFO`) via [`HostSmmuCaps::from_idr`], and handed to
 /// [`SmmuSharedState::resolve_host_caps`], which finalizes the host-derived
-/// vSMMU parameters (currently OAS; room for SSID size, etc.) the first time
-/// a VFIO device binds. Keeping this a plain value type avoids a dependency
-/// from the `smmu` crate on the iommufd bindings.
+/// vSMMU parameters and validates host/guest compatibility the first time a
+/// VFIO device binds. Keeping this a plain value type (with the IDR decoding
+/// owned by this crate) avoids a dependency from the `smmu` crate on the
+/// iommufd bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostSmmuCaps {
-    /// Host SMMUv3 output address size, in bits (decoded from IDR5.OAS).
-    pub oas_bits: u8,
+    /// Host SMMUv3 output address size (IDR5.OAS field). Resolved to a bit
+    /// width (and validated) in [`SmmuSharedState::resolve_host_caps`], since
+    /// the encoding may be one the architecture reserves.
+    pub(crate) oas: crate::spec::cd::Ips,
+    /// Host translation table format support (IDR0.TTF).
+    pub(crate) ttf: registers::Idr0Ttf,
+    /// Host translation table endianness support (IDR0.TTENDIAN).
+    pub(crate) ttendian: registers::Idr0TtEndian,
+    /// Host 4KB translation granule support (IDR5.GRAN4K).
+    pub(crate) gran4k: bool,
+}
+
+impl HostSmmuCaps {
+    /// Decodes the host SMMUv3's capabilities from its `IDR0..IDR5` register
+    /// values, as returned by `IOMMU_GET_HW_INFO` (`idr[n]` is `IDRn`).
+    ///
+    /// The caller (the VFIO layer) supplies the raw register array; this
+    /// crate owns the register layout, so decoding lives here rather than in
+    /// the iommufd bindings. This decode is total — the only field whose value
+    /// may be unrecognized is OAS, whose `Ips` encoding is interpreted in
+    /// [`SmmuSharedState::resolve_host_caps`].
+    pub fn from_idr(idr: [u32; 6]) -> Self {
+        let idr0 = registers::Idr0::from(idr[0]);
+        let idr5 = registers::Idr5::from(idr[5]);
+
+        Self {
+            oas: crate::spec::cd::Ips(idr5.oas()),
+            ttf: registers::Idr0Ttf::from(idr0.ttf()),
+            ttendian: registers::Idr0TtEndian(idr0.ttendian()),
+            gran4k: idr5.gran4k(),
+        }
+    }
 }
 
 /// SMMUv3 device configuration.
@@ -189,17 +221,26 @@ impl SmmuDevice {
         let idr0 = registers::Idr0::new()
             .with_s1p(true)
             .with_s2p(false)
-            .with_ttf(0b10) // AArch64 only
+            // AArch64 page tables only.
+            .with_ttf(registers::Idr0Ttf::new().with_aarch64(true).into())
             .with_cohacc(true)
             .with_asid16(true)
             .with_msi(false)
-            .with_ttendian(0b10) // Little-endian
+            .with_ttendian(registers::Idr0TtEndian::LE.0) // Little-endian only
             .with_stall_model(0b01) // Stall not supported
             .with_term_model(true) // Terminate faults (no stall)
+            // TODO: support 2-level stream tables (ST_LEVEL=0b01) so guests
+            // with large SIDSIZE need not allocate one contiguous table. When
+            // advertised, the host's stream table format is independent and
+            // need not be validated (the guest table is never seen by the host
+            // in the nested path).
             .with_st_level(0b00); // Linear stream table only
 
         let idr1 = registers::Idr1::new()
             .with_sidsize(config.sidsize)
+            // TODO: support substreams (SSID/PASID). When SSIDSIZE > 0, the
+            // accel path must validate the host SMMU's SSIDSIZE >= the
+            // advertised value in resolve_host_caps.
             .with_ssidsize(0)
             .with_cmdqs(8) // 256 entries max
             .with_eventqs(8) // 256 entries max
@@ -208,9 +249,17 @@ impl SmmuDevice {
             .with_queues_preset(false)
             .with_rel(false);
 
+        // IDR3 is left at 0. TODO: support range invalidation (RIL). When
+        // advertised (IDR3.RIL=1), the accel path must validate the host
+        // SMMU supports RIL in resolve_host_caps.
+
         let idr5 = registers::Idr5::new()
             .with_oas(crate::spec::cd::Ips::from_bits(config.oas).0)
             .with_gran4k(true)
+            // TODO: support 16K/64K translation granules. When advertised, the
+            // accel path must validate the host SMMU's GRAN16K/GRAN64K bits in
+            // resolve_host_caps (host must support each granule the guest may
+            // use).
             .with_gran16k(false)
             .with_gran64k(false);
 
