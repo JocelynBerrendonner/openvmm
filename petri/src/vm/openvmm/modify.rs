@@ -441,8 +441,13 @@ impl PetriVmConfigOpenVmm {
     /// complexes.
     pub fn with_smmu(mut self, rc_names: &[&str]) -> Self {
         for name in rc_names {
-            self.pending_iommu
-                .push((name.to_string(), PcieIommuConfig::Smmu { accel: false }));
+            self.pending_iommu.push((
+                name.to_string(),
+                PcieIommuConfig::Smmu {
+                    accel: false,
+                    oas: openvmm_defs::config::SmmuOas::Auto,
+                },
+            ));
         }
         self
     }

@@ -266,6 +266,20 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
         // If nesting, create the iommufd nesting backend and register
         // it with the SMMU shared state.
         if let (Some(entry), Some(nesting_ctx)) = (nesting_entry, &resp.nesting_ctx) {
+            // Finalize the vSMMU's host-derived parameters (OAS, ...) against
+            // the physical SMMU backing this device. Runs once per vSMMU; a
+            // later device on a different physical SMMU is rejected here.
+            let host_caps = crate::iommufd_nesting::query_host_caps(
+                &nesting_ctx.iommufd_ctx,
+                resp.iommufd_devid,
+            )
+            .with_context(|| format!("failed to query host SMMU caps for device {pci_id}"))?;
+
+            entry
+                .smmu_shared
+                .resolve_host_caps(host_caps)
+                .with_context(|| format!("device {pci_id} is incompatible with the host SMMU"))?;
+
             let accel_state = crate::iommufd_nesting::SmmuAccelState::new(
                 nesting_ctx.iommufd_ctx.clone(),
                 resp.iommufd_devid,

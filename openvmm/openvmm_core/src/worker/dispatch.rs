@@ -2284,6 +2284,7 @@ impl InitializedVm {
             &pcie_host_bridges,
             &chipset_builder,
             &gm,
+            mem_layout.end_of_layout(),
         )?;
 
         // Instantiate an AMD IOMMU on each root complex listed in

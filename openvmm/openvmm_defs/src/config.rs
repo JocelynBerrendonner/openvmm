@@ -367,7 +367,21 @@ pub enum PcieIommuConfig {
         /// Enable HW-accelerated nested translation (iommufd). Requires VFIO
         /// devices with `iommu=` behind this SMMU.
         accel: bool,
+        /// Output address size (OAS) resolution policy.
+        oas: SmmuOas,
     },
+}
+
+/// Output address size (OAS) policy for an emulated SMMUv3.
+#[derive(Debug, MeshPayload, Clone, Copy)]
+pub enum SmmuOas {
+    /// Resolve automatically: the host SMMU's OAS for accelerated SMMUs, or
+    /// the smallest encoding covering the guest physical address space for
+    /// non-accelerated SMMUs.
+    Auto,
+    /// Use a fixed OAS in bits (one of 32, 36, 40, 42, 44, 48, 52). For
+    /// accelerated SMMUs this must not exceed the host SMMU's OAS.
+    Fixed(u8),
 }
 
 #[derive(Debug, Protobuf, Default, Clone)]

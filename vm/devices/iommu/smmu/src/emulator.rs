@@ -26,14 +26,53 @@ use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
 use vmcore::save_restore::SaveRestore;
 
+/// Output address size (OAS) resolution policy for the SMMU.
+///
+/// The OAS the SMMU advertises in IDR5 is resolved in two stages. For
+/// non-accelerated SMMUs the value is fully resolved up front (from the
+/// guest physical address space). For accelerated SMMUs the final value
+/// also depends on the physical SMMU backing the device, which is only
+/// known once a VFIO device is bound to iommufd — see
+/// [`SmmuSharedState::resolve_host_caps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmmuOasPolicy {
+    /// Adopt the largest supported OAS. For accel, this becomes the host
+    /// SMMU's OAS at device-attach time; for non-accel it is the smallest
+    /// encoding covering the guest physical address space.
+    Auto,
+    /// Use a fixed OAS in bits. For accel, this is an upper bound that must
+    /// not exceed the host SMMU's OAS (attach fails otherwise).
+    Fixed(u8),
+}
+
+/// Capabilities of the physical SMMUv3 backing an accelerated vSMMU.
+///
+/// Decoded from `IOMMU_GET_HW_INFO` by the VFIO layer and handed to
+/// [`SmmuSharedState::resolve_host_caps`], which finalizes the host-derived
+/// vSMMU parameters (currently OAS; room for SSID size, etc.) the first time
+/// a VFIO device binds. Keeping this a plain value type avoids a dependency
+/// from the `smmu` crate on the iommufd bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSmmuCaps {
+    /// Host SMMUv3 output address size, in bits (decoded from IDR5.OAS).
+    pub oas_bits: u8,
+}
+
 /// SMMUv3 device configuration.
 #[derive(Debug, Clone)]
 pub struct SmmuConfig {
     /// Number of StreamID bits (max 32, typically 16).
     pub sidsize: u8,
-    /// Output address size in bits (e.g., 40 for 40-bit physical addresses).
-    /// Must be one of: 32, 36, 40, 42, 44, 48, 52.
+    /// Initial output address size in bits. Must be one of:
+    /// 32, 36, 40, 42, 44, 48, 52.
+    ///
+    /// For non-accelerated SMMUs this is the final advertised value. For
+    /// accelerated SMMUs it is a provisional floor (covering the guest
+    /// physical address space) that may be raised or validated against the
+    /// host SMMU's OAS when a VFIO device is attached.
     pub oas: u8,
+    /// How the advertised OAS is resolved against the host (accel only).
+    pub oas_policy: SmmuOasPolicy,
     /// Enable HW-accelerated nested S1 translation (iommufd).
     ///
     /// When true, VFIO cdev devices behind this SMMU use hardware-
@@ -47,6 +86,7 @@ impl Default for SmmuConfig {
         Self {
             sidsize: 16,
             oas: 40,
+            oas_policy: SmmuOasPolicy::Fixed(40),
             accel: false,
         }
     }
@@ -180,6 +220,7 @@ impl SmmuDevice {
         let shared_state = SmmuSharedState::new(
             guest_memory.clone(),
             config.oas,
+            config.oas_policy,
             config.accel,
             evtq_irq,
             gerror_irq,
@@ -240,7 +281,14 @@ impl SmmuDevice {
             registers::IDR2 => self.idr2,
             registers::IDR3 => self.idr3,
             registers::IDR4 => self.idr4,
-            registers::IDR5 => self.idr5.into(),
+            registers::IDR5 => {
+                // OAS is resolved dynamically (accel finalizes it against the
+                // host SMMU at device-attach time); the granule bits are fixed.
+                let oas = self.shared_state.oas_bits();
+                self.idr5
+                    .with_oas(crate::spec::cd::Ips::from_bits(oas).0)
+                    .into()
+            }
             registers::IIDR => self.iidr,
             registers::AIDR => self.aidr,
 

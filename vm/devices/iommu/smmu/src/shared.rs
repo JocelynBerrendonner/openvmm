@@ -149,6 +149,8 @@ pub struct SmmuSharedState {
     /// accelerated S1 translation. When `false`, all devices use the
     /// software page table walk path.
     accel: bool,
+    /// How the advertised OAS is resolved (see [`set_oas`](Self::set_oas)).
+    oas_policy: crate::SmmuOasPolicy,
     /// Per-device accelerated backends (VFIO devices with iommufd nested).
     ///
     /// Devices not in this list use the software page table walk path.
@@ -164,6 +166,15 @@ struct SharedStateInner {
     strtab_base: u64,
     /// Stream table log2 size (number of entries).
     strtab_log2size: u8,
+    /// Advertised output address size in bits. Reflected in IDR5.OAS and
+    /// used to derive `oas_mask`.
+    oas_bits: u8,
+    /// Host SMMU capabilities, once an accelerated VFIO device has bound and
+    /// [`SmmuSharedState::resolve_host_caps`] has finalized the host-derived
+    /// parameters. `None` until then (and always `None` for non-accel SMMUs).
+    /// A second device reporting different host caps is rejected — a single
+    /// vSMMU cannot be backed by two physical SMMUs.
+    resolved_host_caps: Option<crate::HostSmmuCaps>,
     /// Output address mask: `(1 << oas_bits) - 1`. Computed addresses for
     /// STE/CD/PT fetches are masked with this per SMMUv3 §3.4.
     oas_mask: u64,
@@ -214,12 +225,16 @@ pub(crate) struct SavedQueueState {
 impl SmmuSharedState {
     /// Creates a new shared state with the SMMU disabled.
     ///
-    /// `oas_bits` is the output address size in bits (e.g., 40 for a 40-bit
-    /// physical address space). Computed addresses for STE/CD/PT fetches are
-    /// truncated to this width, matching hardware behavior per SMMUv3 §3.4.
+    /// `oas_bits` is the initial output address size in bits (e.g., 40 for a
+    /// 40-bit physical address space). Computed addresses for STE/CD/PT
+    /// fetches are truncated to this width, matching hardware behavior per
+    /// SMMUv3 §3.4. `oas_policy` controls whether the value is finalized
+    /// against the host SMMU at device-attach time (see
+    /// [`Self::resolve_host_caps`]).
     pub fn new(
         guest_memory: GuestMemory,
         oas_bits: u8,
+        oas_policy: crate::SmmuOasPolicy,
         accel: bool,
         evtq_irq: Option<LineInterrupt>,
         gerror_irq: Option<LineInterrupt>,
@@ -230,6 +245,8 @@ impl SmmuSharedState {
                 enabled: false,
                 strtab_base: 0,
                 strtab_log2size: 0,
+                oas_bits,
+                resolved_host_caps: None,
                 oas_mask,
             }),
             guest_memory,
@@ -247,6 +264,7 @@ impl SmmuSharedState {
             evtq_irq,
             gerror_irq,
             accel,
+            oas_policy,
             accel_devices: RwLock::new(Vec::new()),
         })
     }
@@ -254,6 +272,56 @@ impl SmmuSharedState {
     /// Returns whether this SMMU is in accelerated mode (iommufd nested).
     pub fn is_accel(&self) -> bool {
         self.accel
+    }
+
+    /// Returns the currently advertised output address size in bits.
+    pub fn oas_bits(&self) -> u8 {
+        self.inner.read().oas_bits
+    }
+
+    /// Finalizes the host-derived vSMMU parameters against the physical SMMU
+    /// backing an accelerated device.
+    ///
+    /// Called when an accelerated VFIO device binds to iommufd, at which
+    /// point the backing physical SMMU is first known. Runs once per vSMMU:
+    /// the first device applies every host-derived parameter according to its
+    /// configured policy (currently OAS — `auto` adopts the host value;
+    /// `fixed` is validated as an upper bound). Subsequent devices must report
+    /// identical host caps; a mismatch is rejected, since a single vSMMU
+    /// cannot be backed by two different physical SMMUs.
+    pub fn resolve_host_caps(&self, caps: crate::HostSmmuCaps) -> anyhow::Result<()> {
+        let mut inner = self.inner.write();
+
+        if let Some(existing) = inner.resolved_host_caps {
+            if existing != caps {
+                anyhow::bail!(
+                    "SMMU already bound to a physical SMMU ({existing:?}), but another \
+                     device reports different host capabilities ({caps:?}); a single \
+                     vSMMU cannot be backed by two physical SMMUs"
+                );
+            }
+            return Ok(());
+        }
+
+        // OAS: `auto` adopts the host value; `fixed` must not exceed it.
+        match self.oas_policy {
+            crate::SmmuOasPolicy::Auto => {
+                inner.oas_bits = caps.oas_bits;
+                inner.oas_mask = (1u64 << caps.oas_bits) - 1;
+            }
+            crate::SmmuOasPolicy::Fixed(oas) => {
+                if oas > caps.oas_bits {
+                    anyhow::bail!(
+                        "configured SMMU oas={oas} exceeds host SMMU OAS {}; \
+                         lower the configured OAS or use oas=auto",
+                        caps.oas_bits
+                    );
+                }
+            }
+        }
+
+        inner.resolved_host_caps = Some(caps);
+        Ok(())
     }
 
     /// Updates the SMMU enable state (called by SmmuDevice on CR0 writes).
@@ -1079,7 +1147,14 @@ mod tests {
     }
 
     fn make_shared_state(gm: &GuestMemory) -> Arc<SmmuSharedState> {
-        let state = SmmuSharedState::new(gm.clone(), 40, false, None, None);
+        let state = SmmuSharedState::new(
+            gm.clone(),
+            40,
+            crate::SmmuOasPolicy::Fixed(40),
+            false,
+            None,
+            None,
+        );
         state.set_strtab(STRTAB_BASE, STRTAB_LOG2SIZE);
         state.set_enabled(true);
         // Enable EVTQ so fault events are written to guest memory.
@@ -1306,7 +1381,14 @@ mod tests {
         let data = b"disabled smmu";
         gm.write_at(0x3000, data).unwrap();
 
-        let state = SmmuSharedState::new(gm.clone(), 40, false, None, None);
+        let state = SmmuSharedState::new(
+            gm.clone(),
+            40,
+            crate::SmmuOasPolicy::Fixed(40),
+            false,
+            None,
+            None,
+        );
         let bus_range = make_bus_range();
         let mock_msi = MockSignalMsi::new();
 

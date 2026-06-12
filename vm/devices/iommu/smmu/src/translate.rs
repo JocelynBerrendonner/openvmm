@@ -171,7 +171,11 @@ pub fn lookup_cd(
     );
 
     if !cd.valid() {
-        tracelimit::warn_ratelimited!(sid, cd_addr = format_args!("{:#x}", cd_addr), "lookup_cd: CD not valid");
+        tracelimit::warn_ratelimited!(
+            sid,
+            cd_addr = format_args!("{:#x}", cd_addr),
+            "lookup_cd: CD not valid"
+        );
         return Err(SmmuFault::bad_cd(sid));
     }
 

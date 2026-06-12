@@ -571,8 +571,8 @@ options:
 
     /// configure SMMUv3 IOMMU for an aarch64 PCIe root complex (repeatable).
     ///
-    /// Syntax: `rc=<name>[,accel]` or plain `<name>` as shorthand for
-    /// `rc=<name>`.
+    /// Syntax: `rc=<name>[,accel][,oas=auto|N]` or plain `<name>` as
+    /// shorthand for `rc=<name>`.
     #[cfg(guest_arch = "aarch64")]
     #[clap(long, value_name = "SMMU_CONFIG")]
     pub smmu: Vec<SmmuCli>,
@@ -3488,7 +3488,8 @@ impl FromStr for VfioDeviceCli {
 
 /// CLI configuration for an SMMUv3 instance.
 ///
-/// Syntax: `rc=<name>[,accel]` or plain `<name>` as shorthand for `rc=<name>`.
+/// Syntax: `rc=<name>[,accel][,oas=auto|N]` or plain `<name>` as shorthand
+/// for `rc=<name>`. `oas` defaults to `auto`.
 #[cfg(guest_arch = "aarch64")]
 #[derive(Clone, Debug)]
 pub struct SmmuCli {
@@ -3496,6 +3497,18 @@ pub struct SmmuCli {
     pub rc_name: String,
     /// Enable HW-accelerated nested translation (iommufd).
     pub accel: bool,
+    /// Output address size policy.
+    pub oas: SmmuOasCli,
+}
+
+/// Output address size (OAS) policy parsed from `--smmu`.
+#[cfg(guest_arch = "aarch64")]
+#[derive(Clone, Copy, Debug)]
+pub enum SmmuOasCli {
+    /// Resolve automatically (host OAS for accel, GPA-covering for non-accel).
+    Auto,
+    /// Fixed OAS in bits (one of 32, 36, 40, 42, 44, 48, 52).
+    Fixed(u8),
 }
 
 #[cfg(guest_arch = "aarch64")]
@@ -3508,11 +3521,13 @@ impl FromStr for SmmuCli {
             return Ok(SmmuCli {
                 rc_name: s.to_string(),
                 accel: false,
+                oas: SmmuOasCli::Auto,
             });
         }
 
         let mut rc_name: Option<String> = None;
         let mut accel = false;
+        let mut oas = SmmuOasCli::Auto;
 
         for part in s.split(',') {
             if let Some((key, value)) = part.split_once('=') {
@@ -3525,6 +3540,16 @@ impl FromStr for SmmuCli {
                             anyhow::bail!("--smmu: 'rc=' value cannot be empty");
                         }
                         rc_name = Some(value.to_string());
+                    }
+                    "oas" => {
+                        oas = if value == "auto" {
+                            SmmuOasCli::Auto
+                        } else {
+                            let bits: u8 = value
+                                .parse()
+                                .context("--smmu: oas must be 'auto' or a number")?;
+                            SmmuOasCli::Fixed(bits)
+                        };
                     }
                     _ => anyhow::bail!("unknown --smmu key: '{key}'"),
                 }
@@ -3539,7 +3564,11 @@ impl FromStr for SmmuCli {
 
         let rc_name = rc_name.context("--smmu: 'rc=' is required")?;
 
-        Ok(SmmuCli { rc_name, accel })
+        Ok(SmmuCli {
+            rc_name,
+            accel,
+            oas,
+        })
     }
 }
 

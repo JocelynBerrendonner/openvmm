@@ -66,6 +66,7 @@ pub(super) fn setup_smmu(
     pcie_host_bridges: &[PcieHostBridge],
     chipset_builder: &ChipsetBuilder<'_>,
     gm: &GuestMemory,
+    gpa_top: u64,
 ) -> anyhow::Result<SmmuDevicesResult> {
     // Instantiate SMMU chipset devices.
     let mut shared_states: Vec<Option<Arc<smmu::SmmuSharedState>>> =
@@ -74,20 +75,55 @@ pub(super) fn setup_smmu(
 
     // Iterate RCs with SMMU enabled, zipping with resolved MMIO+SPI resources.
     let smmu_rcs = root_complexes.iter().filter_map(|rc| match &rc.iommu {
-        Some(openvmm_defs::config::PcieIommuConfig::Smmu { accel, .. }) => Some((rc, *accel)),
+        Some(openvmm_defs::config::PcieIommuConfig::Smmu { accel, oas }) => {
+            Some((rc, *accel, *oas))
+        }
         _ => None,
     });
 
-    for (idx, (rc, accel)) in smmu_rcs.enumerate() {
+    for (idx, (rc, accel, oas)) in smmu_rcs.enumerate() {
         let rc_pos = pcie_rc_name_to_idx[rc.name.as_str()];
 
         let smmu = &resolved_smmu_resources[idx];
         let evtq_irq_vector = smmu.evtq_intid - *vmm_core::emuplat::gic::SPI_RANGE.start();
         let gerror_irq_vector = smmu.gerr_intid - *vmm_core::emuplat::gic::SPI_RANGE.start();
         let device_name = format!("smmu:{}", rc.name);
+
+        // The smallest valid OAS that covers the guest's DMA address space:
+        // RAM/layout top plus this root complex's high MMIO top (for P2P and
+        // MSI doorbell targets).
+        let dma_top = gpa_top.max(pcie_host_bridges[rc_pos].high_mmio.end());
+        let gpa_oas = smmu::min_oas_bits_for(dma_top);
+
+        // Resolve the OAS policy into an initial advertised value. For
+        // non-accel SMMUs this is final; for accel SMMUs it is a provisional
+        // floor that is finalized against the host SMMU at device attach.
+        let (oas_bits, oas_policy) = match oas {
+            openvmm_defs::config::SmmuOas::Auto => (gpa_oas, smmu::SmmuOasPolicy::Auto),
+            openvmm_defs::config::SmmuOas::Fixed(bits) => {
+                if !smmu::VALID_OAS_BITS.contains(&bits) {
+                    anyhow::bail!(
+                        "--smmu rc={}: oas={bits} is not a valid SMMUv3 output address \
+                         size (expected one of {:?})",
+                        rc.name,
+                        smmu::VALID_OAS_BITS
+                    );
+                }
+                if !accel && bits < gpa_oas {
+                    anyhow::bail!(
+                        "--smmu rc={}: oas={bits} is too small for the guest address \
+                         space (needs at least {gpa_oas} bits); use oas=auto",
+                        rc.name
+                    );
+                }
+                (bits, smmu::SmmuOasPolicy::Fixed(bits))
+            }
+        };
+
         let smmu_config = smmu::SmmuConfig {
             sidsize: 16,
-            oas: 44,
+            oas: oas_bits,
+            oas_policy,
             accel,
         };
         let smmu_device =

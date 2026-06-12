@@ -347,8 +347,7 @@ impl IortRmr {
         }
         // rmr_offset comes after the ID mappings.
         let rmr_offset = if rmr_count > 0 {
-            size_of::<Self>() as u32
-                + mapping_count * size_of::<IortIdMapping>() as u32
+            size_of::<Self>() as u32 + mapping_count * size_of::<IortIdMapping>() as u32
         } else {
             0
         };

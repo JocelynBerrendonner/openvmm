@@ -899,11 +899,17 @@ async fn vm_config_from_command_line(
             cxl,
             ports,
             #[cfg(guest_arch = "aarch64")]
-            iommu: opt
-                .smmu
-                .iter()
-                .find(|s| s.rc_name == rc_cli.name)
-                .map(|s| openvmm_defs::config::PcieIommuConfig::Smmu { accel: s.accel }),
+            iommu: opt.smmu.iter().find(|s| s.rc_name == rc_cli.name).map(|s| {
+                openvmm_defs::config::PcieIommuConfig::Smmu {
+                    accel: s.accel,
+                    oas: match s.oas {
+                        cli_args::SmmuOasCli::Auto => openvmm_defs::config::SmmuOas::Auto,
+                        cli_args::SmmuOasCli::Fixed(bits) => {
+                            openvmm_defs::config::SmmuOas::Fixed(bits)
+                        }
+                    },
+                }
+            }),
             #[cfg(guest_arch = "x86_64")]
             iommu: opt
                 .amd_iommu

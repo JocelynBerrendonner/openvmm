@@ -42,6 +42,36 @@ use std::os::unix::prelude::*;
 use std::sync::Arc;
 use vfio_sys::iommufd::IommufdCtx;
 
+/// Query the physical SMMUv3's capabilities for a device bound to iommufd.
+///
+/// Issues a single `IOMMU_GET_HW_INFO` and decodes the fields the vSMMU
+/// finalizes against the host (currently IDR5.OAS). Handed to
+/// [`smmu::SmmuSharedState::resolve_host_caps`].
+pub fn query_host_caps(ctx: &IommufdCtx, dev_id: u32) -> anyhow::Result<smmu::HostSmmuCaps> {
+    let mut info = vfio_sys::iommufd::IommuHwInfoArmSmmuv3 {
+        flags: 0,
+        __reserved: 0,
+        idr: [0; 6],
+        iidr: 0,
+        aidr: 0,
+    };
+    let (data_type, _caps) = ctx
+        .get_hw_info(
+            dev_id,
+            std::ptr::from_mut(&mut info) as u64,
+            size_of::<vfio_sys::iommufd::IommuHwInfoArmSmmuv3>() as u32,
+        )
+        .context("IOMMU_GET_HW_INFO failed")?;
+    if data_type != vfio_sys::iommufd::IOMMU_HW_INFO_TYPE_ARM_SMMUV3 {
+        anyhow::bail!("unexpected host IOMMU hw info type {data_type} (expected ARM SMMUv3)");
+    }
+    // IDR5.OAS is the low 3 bits of IDR5 (idr[5]).
+    let oas_enc = (info.idr[5] & 0x7) as u8;
+    let oas_bits = smmu::oas_bits_from_encoding(oas_enc)
+        .with_context(|| format!("host SMMUv3 reported unknown OAS encoding {oas_enc}"))?;
+    Ok(smmu::HostSmmuCaps { oas_bits })
+}
+
 /// STE Config field values (bits `[3:1]` of DW0).
 ///
 /// Duplicated from smmu::spec to avoid re-exporting internal spec types.
@@ -195,8 +225,7 @@ impl IommufdStreamBackend {
     // domains; all other bits must be zero.
     //
     // DW0: V | CFG | S1FMT | S1CTXPTR | S1CDMAX
-    const STE0_NESTING_ALLOWED: u64 =
-        0xFFFF_FFFF_FFFF_FFFF; // all of DW0 is covered by allowed fields
+    const STE0_NESTING_ALLOWED: u64 = 0xFFFF_FFFF_FFFF_FFFF; // all of DW0 is covered by allowed fields
     // DW1: S1DSS | S1CIR | S1COR | S1CSH | S1STALLD | EATS
     const STE1_NESTING_ALLOWED: u64 = {
         let s1dss = 0x3; // bits [1:0]
@@ -215,7 +244,10 @@ impl IommufdStreamBackend {
     fn extract_ste_dwords(ste_bytes: &[u8; 64]) -> [u64; 2] {
         let dw0 = u64::from_le_bytes(ste_bytes[0..8].try_into().unwrap());
         let dw1 = u64::from_le_bytes(ste_bytes[8..16].try_into().unwrap());
-        [dw0 & Self::STE0_NESTING_ALLOWED, dw1 & Self::STE1_NESTING_ALLOWED]
+        [
+            dw0 & Self::STE0_NESTING_ALLOWED,
+            dw1 & Self::STE1_NESTING_ALLOWED,
+        ]
     }
 
     /// Handle STE Config=ABORT: detach from any HWPT.
