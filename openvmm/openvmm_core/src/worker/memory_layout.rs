@@ -306,7 +306,7 @@ pub(super) fn resolve_memory_layout(
     let smmu_count = input
         .pcie_root_complexes
         .iter()
-        .filter(|rc| matches!(rc.iommu, Some(PcieIommuConfig::Smmu)))
+        .filter(|rc| matches!(rc.iommu, Some(PcieIommuConfig::Smmu { .. })))
         .count();
     let mut smmu_ranges: Vec<MemoryRange> = vec![MemoryRange::EMPTY; smmu_count];
     for (idx, range) in smmu_ranges.iter_mut().enumerate() {

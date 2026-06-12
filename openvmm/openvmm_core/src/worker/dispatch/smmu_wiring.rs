@@ -73,11 +73,12 @@ pub(super) fn setup_smmu(
     let mut configs = Vec::new();
 
     // Iterate RCs with SMMU enabled, zipping with resolved MMIO+SPI resources.
-    let smmu_rcs = root_complexes
-        .iter()
-        .filter(|rc| matches!(rc.iommu, Some(openvmm_defs::config::PcieIommuConfig::Smmu)));
+    let smmu_rcs = root_complexes.iter().filter_map(|rc| match &rc.iommu {
+        Some(openvmm_defs::config::PcieIommuConfig::Smmu { accel, .. }) => Some((rc, *accel)),
+        _ => None,
+    });
 
-    for (idx, rc) in smmu_rcs.enumerate() {
+    for (idx, (rc, accel)) in smmu_rcs.enumerate() {
         let rc_pos = pcie_rc_name_to_idx[rc.name.as_str()];
 
         let smmu = &resolved_smmu_resources[idx];
@@ -87,7 +88,7 @@ pub(super) fn setup_smmu(
         let smmu_config = smmu::SmmuConfig {
             sidsize: 16,
             oas: 44,
-            accel: inst.accel,
+            accel,
         };
         let smmu_device =
             chipset_builder
@@ -110,7 +111,7 @@ pub(super) fn setup_smmu(
         // the L2 guest's S1 page tables. The window is 128MB–129MB
         // (0x800_0000–0x80F_FFFF), which is the default ARM IOMMU MSI
         // reserved region.
-        let reserved_iova_ranges = if inst.accel {
+        let reserved_iova_ranges = if accel {
             vec![(0x800_0000, 0x80F_FFFF)]
         } else {
             Vec::new()

@@ -902,8 +902,8 @@ async fn vm_config_from_command_line(
             iommu: opt
                 .smmu
                 .iter()
-                .any(|s| s == &rc_cli.name)
-                .then_some(openvmm_defs::config::PcieIommuConfig::Smmu),
+                .find(|s| s.rc_name == rc_cli.name)
+                .map(|s| openvmm_defs::config::PcieIommuConfig::Smmu { accel: s.accel }),
             #[cfg(guest_arch = "x86_64")]
             iommu: opt
                 .amd_iommu
@@ -917,10 +917,11 @@ async fn vm_config_from_command_line(
 
     // Validate that all --smmu / --amd-iommu names refer to known root complexes.
     #[cfg(guest_arch = "aarch64")]
-    for name in &opt.smmu {
+    for s in &opt.smmu {
         anyhow::ensure!(
-            pcie_root_complexes.iter().any(|rc| rc.name == *name),
-            "--smmu refers to unknown root complex '{name}'"
+            pcie_root_complexes.iter().any(|rc| rc.name == s.rc_name),
+            "--smmu refers to unknown root complex '{}'",
+            s.rc_name
         );
     }
     #[cfg(guest_arch = "x86_64")]
@@ -1575,18 +1576,6 @@ async fn vm_config_from_command_line(
         task.detach();
         vmbus_devices.push((openhcl_vtl, resource));
     }
-
-    #[cfg(guest_arch = "aarch64")]
-    let smmu_instances: Vec<openvmm_defs::config::SmmuInstanceConfig> = opt
-        .smmu
-        .iter()
-        .map(|s| openvmm_defs::config::SmmuInstanceConfig {
-            rc_name: s.rc_name.clone(),
-            accel: s.accel,
-            ats: s.ats,
-            ssidsize: s.ssidsize,
-        })
-        .collect();
 
     #[cfg(guest_arch = "aarch64")]
     let topology_arch = openvmm_defs::config::ArchTopologyConfig::Aarch64(
