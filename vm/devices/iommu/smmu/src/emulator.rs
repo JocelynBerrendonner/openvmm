@@ -741,7 +741,8 @@ impl SmmuDevice {
         self.shared_state.toggle_cmdq_err();
     }
 
-    /// Read the STE for `sid` from guest memory and forward to the
+    /// Read the STE for `sid` from guest memory, decode it, and forward the
+    /// resulting [`StreamConfig`](crate::shared::StreamConfig) to the
     /// accelerated backend.
     fn dispatch_cfgi_ste(&self, sid: u32, backend: &dyn crate::shared::AcceleratedStreamBackend) {
         let (strtab_base, strtab_log2size) = self.shared_state.strtab_config();
@@ -756,18 +757,21 @@ impl SmmuDevice {
         }
 
         let ste_addr = strtab_base + (sid as u64) * (size_of::<Ste>() as u64);
-        let mut ste_bytes = [0u8; 64];
-        if let Err(e) = self.guest_memory.read_at(ste_addr, &mut ste_bytes) {
-            tracelimit::warn_ratelimited!(
-                error = &e as &dyn std::error::Error,
-                ste_addr,
-                sid,
-                "smmu: failed to read STE for accelerated CFGI_STE"
-            );
-            return;
-        }
+        let ste = match self.guest_memory.read_plain::<Ste>(ste_addr) {
+            Ok(ste) => ste,
+            Err(e) => {
+                tracelimit::warn_ratelimited!(
+                    error = &e as &dyn std::error::Error,
+                    ste_addr,
+                    sid,
+                    "smmu: failed to read STE for accelerated CFGI_STE"
+                );
+                return;
+            }
+        };
 
-        if let Err(e) = backend.on_cfgi_ste(sid, &ste_bytes) {
+        let config = crate::shared::StreamConfig::from_ste(&ste);
+        if let Err(e) = backend.set_stream_config(sid, config) {
             tracelimit::warn_ratelimited!(
                 error = &*e as &dyn std::error::Error,
                 sid,

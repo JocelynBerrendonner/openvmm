@@ -21,6 +21,7 @@ pub use shared::AcceleratedStreamBackend;
 pub use shared::SmmuSharedState;
 pub use shared::SmmuSignalMsi;
 pub use shared::SmmuTranslator;
+pub use shared::StreamConfig;
 
 /// Valid SMMUv3 output address sizes, in bits (IDR5.OAS encodings).
 pub const VALID_OAS_BITS: [u8; 7] = [32, 36, 40, 42, 44, 48, 52];

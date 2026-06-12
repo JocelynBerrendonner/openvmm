@@ -59,6 +59,33 @@ impl Ste {
     pub fn s1_fmt(&self) -> u8 {
         self.qw0.s1_fmt()
     }
+
+    /// Returns STE double-words 0 and 1 with only the stage-1 configuration
+    /// fields retained, zeroing everything else.
+    ///
+    /// Retained — DW0: V, Config, S1Fmt, S1ContextPtr, S1CDMax;
+    /// DW1: S1DSS, S1CIR, S1COR, S1CSH, S1STALLD, EATS. All reserved bits and
+    /// stage-2/override fields are dropped. Rebuilding the words through the
+    /// typed field setters (rather than a hand-computed mask) keeps the
+    /// selection tied to the spec definitions above.
+    pub fn nesting_dwords(&self) -> [u64; 2] {
+        let dw0 = SteDw0::new()
+            .with_v(self.qw0.v())
+            .with_config(self.qw0.config())
+            .with_s1_fmt(self.qw0.s1_fmt())
+            .with_s1_context_ptr(self.qw0.s1_context_ptr())
+            .with_s1_cd_max(self.qw0.s1_cd_max());
+
+        let dw1 = SteDw1::new()
+            .with_s1_dss(self.qw1.s1_dss())
+            .with_s1_cir(self.qw1.s1_cir())
+            .with_s1_cor(self.qw1.s1_cor())
+            .with_s1_csh(self.qw1.s1_csh())
+            .with_s1stalld(self.qw1.s1stalld())
+            .with_eats(self.qw1.eats());
+
+        [dw0.into(), dw1.into()]
+    }
 }
 
 /// STE QW0 (bits `[63:0]`): Valid, Config, S1 pointers.
@@ -266,5 +293,54 @@ mod tests {
         assert_eq!(ste.s1_context_ptr(), cd_addr);
         assert_eq!(ste.s1_cd_max(), 0);
         assert_eq!(ste.s1_fmt(), S1Fmt::LINEAR.0);
+    }
+
+    #[test]
+    fn test_nesting_dwords_preserves_allowed_fields() {
+        // Set every field the nesting path reads, with distinct values.
+        let cd_addr: u64 = 0x3_FFFF_FFFF_F000;
+        let qw0 = SteDw0::new()
+            .with_v(true)
+            .with_config(SteConfig::S1_TRANS.0)
+            .with_s1_fmt(S1Fmt::TWO_LEVEL_64K.0)
+            .with_s1_context_ptr(cd_addr >> 6)
+            .with_s1_cd_max(0x1f);
+        let qw1 = SteDw1::new()
+            .with_s1_dss(0x3)
+            .with_s1_cir(0x3)
+            .with_s1_cor(0x3)
+            .with_s1_csh(0x3)
+            .with_s1stalld(true)
+            .with_eats(0x3);
+        let ste = Ste {
+            qw0,
+            qw1,
+            _qw2_7: [0; 6],
+        };
+
+        let [out0, out1] = ste.nesting_dwords();
+        // Allowed fields survive untouched.
+        assert_eq!(out0, u64::from(qw0));
+        assert_eq!(out1, u64::from(qw1));
+    }
+
+    #[test]
+    fn test_nesting_dwords_drops_disallowed_fields() {
+        // A fully-populated STE must be reduced to only the allowed fields.
+        let ste = Ste {
+            qw0: SteDw0::from(u64::MAX),
+            qw1: SteDw1::from(u64::MAX),
+            _qw2_7: [u64::MAX; 6],
+        };
+        let [out0, out1] = ste.nesting_dwords();
+
+        // DW0 allowed: V[0] | Config[3:1] | S1Fmt[5:4] | S1ContextPtr[55:6] |
+        // S1CDMax[63:59]. The reserved bits [58:56] between S1ContextPtr and
+        // S1CDMax must be cleared, otherwise IOMMU_HWPT_ALLOC fails with -EIO.
+        assert_eq!(out0, 0xf8ff_ffff_ffff_ffff);
+        // DW1 allowed: S1DSS[1:0] | S1CIR[3:2] | S1COR[5:4] | S1CSH[7:6] |
+        // S1STALLD[27] | EATS[29:28]. Everything else (STRW, SHCFG, NSCFG,
+        // PRIVCFG, ...) must be cleared.
+        assert_eq!(out1, 0x3800_00ff);
     }
 }

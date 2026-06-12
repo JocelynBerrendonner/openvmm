@@ -5,9 +5,10 @@
 //!
 //! This module implements HW-accelerated nested stage 1 translation using
 //! iommufd. The guest programs the emulated SMMU's stream table entries (STEs)
-//! and page tables. The VMM intercepts CMDQ commands via the
-//! [`smmu::AcceleratedStreamBackend`] trait and forwards raw STE bytes and
-//! invalidation commands to iommufd, which programs the host IOMMU hardware.
+//! and page tables. The SMMU emulator decodes the guest's CMDQ commands and
+//! dispatches a [`smmu::StreamConfig`] (and raw invalidation commands) to this
+//! module via the [`smmu::AcceleratedStreamBackend`] trait, which programs the
+//! host IOMMU hardware.
 //!
 //! # Architecture
 //!
@@ -15,11 +16,11 @@
 //! Guest programs emulated SMMU ──► CMDQ commands
 //!        │
 //!        ▼
-//! SmmuDevice dispatches to registered AcceleratedStreamBackend
+//! SmmuDevice decodes STE/CMDQ and dispatches to AcceleratedStreamBackend
 //!        │
 //!        ▼
 //! IommufdStreamBackend (per VFIO device)
-//!   ├─ on_cfgi_ste: parse STE.Config, allocate/switch nested HWPT
+//!   ├─ set_stream_config: map StreamConfig → allocate/switch nested HWPT
 //!   └─ on_tlbi: forward raw command to iommufd HWPT_INVALIDATE
 //!        │
 //!        ▼
@@ -70,15 +71,6 @@ pub fn query_host_caps(ctx: &IommufdCtx, dev_id: u32) -> anyhow::Result<smmu::Ho
     let oas_bits = smmu::oas_bits_from_encoding(oas_enc)
         .with_context(|| format!("host SMMUv3 reported unknown OAS encoding {oas_enc}"))?;
     Ok(smmu::HostSmmuCaps { oas_bits })
-}
-
-/// STE Config field values (bits `[3:1]` of DW0).
-///
-/// Duplicated from smmu::spec to avoid re-exporting internal spec types.
-mod ste_config {
-    pub const ABORT: u8 = 0b000;
-    pub const BYPASS: u8 = 0b100;
-    pub const S1_TRANS: u8 = 0b101;
 }
 
 /// Per-SMMU iommufd objects for HW-accelerated nested translation.
@@ -212,44 +204,6 @@ impl IommufdStreamBackend {
         }
     }
 
-    /// Extract the STE Config field (bits [3:1] of DW0) from raw STE bytes.
-    fn parse_ste_config(ste_bytes: &[u8; 64]) -> (bool, u8) {
-        let dw0 = u64::from_le_bytes(ste_bytes[0..8].try_into().unwrap());
-        let valid = (dw0 & 1) != 0;
-        let config = ((dw0 >> 1) & 0x7) as u8;
-        (valid, config)
-    }
-
-    // Nesting-allowed masks from the kernel's arm-smmu-v3.h.
-    // Only these STE fields are accepted by IOMMU_HWPT_ALLOC for nested
-    // domains; all other bits must be zero.
-    //
-    // DW0: V | CFG | S1FMT | S1CTXPTR | S1CDMAX
-    const STE0_NESTING_ALLOWED: u64 = 0xFFFF_FFFF_FFFF_FFFF; // all of DW0 is covered by allowed fields
-    // DW1: S1DSS | S1CIR | S1COR | S1CSH | S1STALLD | EATS
-    const STE1_NESTING_ALLOWED: u64 = {
-        let s1dss = 0x3; // bits [1:0]
-        let s1cir = 0x3 << 2; // bits [3:2]
-        let s1cor = 0x3 << 4; // bits [5:4]
-        let s1csh = 0x3 << 6; // bits [7:6]
-        let s1stalld = 1 << 27; // bit 27
-        let eats = 0x3 << 28; // bits [29:28]
-        s1dss | s1cir | s1cor | s1csh | s1stalld | eats
-    };
-
-    /// Extract STE DW0 and DW1 (first 16 bytes) for nested HWPT allocation.
-    ///
-    /// Masks off bits that the kernel does not allow for nested domains
-    /// (e.g., SHCFG, STRW) to prevent EIO from `IOMMU_HWPT_ALLOC`.
-    fn extract_ste_dwords(ste_bytes: &[u8; 64]) -> [u64; 2] {
-        let dw0 = u64::from_le_bytes(ste_bytes[0..8].try_into().unwrap());
-        let dw1 = u64::from_le_bytes(ste_bytes[8..16].try_into().unwrap());
-        [
-            dw0 & Self::STE0_NESTING_ALLOWED,
-            dw1 & Self::STE1_NESTING_ALLOWED,
-        ]
-    }
-
     /// Handle STE Config=ABORT: detach from any HWPT.
     fn handle_abort(&self, state: &mut StreamBackendState) -> anyhow::Result<()> {
         // Detach from current attachment (if any).
@@ -305,41 +259,42 @@ impl IommufdStreamBackend {
     fn handle_s1_translate(
         &self,
         state: &mut StreamBackendState,
-        ste_bytes: &[u8; 64],
-        stream_id: Option<u32>,
+        nested_ste: [u64; 2],
+        stream_id: u32,
     ) -> anyhow::Result<()> {
-        // Lazy vDevice allocation — the virtual stream ID comes from the
-        // CFGI_STE command's SID, which is the guest-assigned BDF.
+        // Lazy vDevice allocation — the virtual stream ID is the guest-assigned
+        // BDF from the CFGI_STE command's SID, not known at construction time.
         if state.vdevice_id.is_none() {
-            if let Some(sid) = stream_id {
-                let vdev_id = self
-                    .accel
-                    .ctx
-                    .vdevice_alloc(self.accel.viommu_id, self.dev_id, sid as u64)
-                    .with_context(|| {
-                        format!(
-                            "failed to allocate vDevice for dev_id={}, vsid={}",
-                            self.dev_id, sid
-                        )
-                    })?;
-                tracing::info!(
-                    dev_id = self.dev_id,
-                    vdevice_id = vdev_id,
-                    virtual_sid = sid,
-                    "allocated iommufd vDevice"
-                );
-                state.vdevice_id = Some(vdev_id);
-            }
+            let vdev_id = self
+                .accel
+                .ctx
+                .vdevice_alloc(self.accel.viommu_id, self.dev_id, stream_id as u64)
+                .with_context(|| {
+                    format!(
+                        "failed to allocate vDevice for dev_id={}, vsid={}",
+                        self.dev_id, stream_id
+                    )
+                })?;
+            tracing::info!(
+                dev_id = self.dev_id,
+                vdevice_id = vdev_id,
+                virtual_sid = stream_id,
+                "allocated iommufd vDevice"
+            );
+            state.vdevice_id = Some(vdev_id);
         }
 
-        // Extract STE DW0-1 for the nested HWPT allocation.
-        let ste_dwords = Self::extract_ste_dwords(ste_bytes);
-        let ste_data = vfio_sys::iommufd::IommuHwptArmSmmuv3 { ste: ste_dwords };
+        // The STE the kernel reads to program nested stage-1 translation.
+        // `nested_ste` carries only the stage-1 fields (the emulator stripped
+        // everything else): the kernel's arm-smmu-v3 nesting path validates
+        // the STE and rejects (`-EIO`) any reserved or stage-2/override bits
+        // it doesn't expect, so they must already be cleared here.
+        let ste_data = vfio_sys::iommufd::IommuHwptArmSmmuv3 { ste: nested_ste };
 
         tracing::info!(
             dev_id = self.dev_id,
-            ste_dw0 = format_args!("{:#018x}", ste_dwords[0]),
-            ste_dw1 = format_args!("{:#018x}", ste_dwords[1]),
+            ste_dw0 = format_args!("{:#018x}", nested_ste[0]),
+            ste_dw1 = format_args!("{:#018x}", nested_ste[1]),
             "SMMU accel: allocating nested HWPT with STE data"
         );
 
@@ -388,28 +343,13 @@ impl IommufdStreamBackend {
 }
 
 impl smmu::AcceleratedStreamBackend for IommufdStreamBackend {
-    fn on_cfgi_ste(&self, sid: u32, ste_bytes: &[u8; 64]) -> anyhow::Result<()> {
-        let (valid, config) = Self::parse_ste_config(ste_bytes);
-
-        // Invalid STE (V=0) is treated as ABORT.
-        if !valid {
-            let mut state = self.state.lock();
-            return self.handle_abort(&mut state);
-        }
-
+    fn set_stream_config(&self, sid: u32, config: smmu::StreamConfig) -> anyhow::Result<()> {
         let mut state = self.state.lock();
         match config {
-            ste_config::ABORT => self.handle_abort(&mut state),
-            ste_config::BYPASS => self.handle_bypass(&mut state),
-            ste_config::S1_TRANS => self.handle_s1_translate(&mut state, ste_bytes, Some(sid)),
-            other => {
-                tracelimit::warn_ratelimited!(
-                    dev_id = self.dev_id,
-                    config = other,
-                    "SMMU accel: unsupported STE config for nested S1"
-                );
-                // Treat unsupported configs as ABORT.
-                self.handle_abort(&mut state)
+            smmu::StreamConfig::Abort => self.handle_abort(&mut state),
+            smmu::StreamConfig::Bypass => self.handle_bypass(&mut state),
+            smmu::StreamConfig::Translate { nested_ste } => {
+                self.handle_s1_translate(&mut state, nested_ste, sid)
             }
         }
     }

@@ -45,27 +45,73 @@ use zerocopy::IntoBytes;
 /// software page table walk path (emulated devices). Streams with a backend
 /// use hardware-accelerated translation via iommufd.
 ///
-/// The VMM passes raw STE bytes and raw command bytes to the backend,
-/// following QEMU's proven approach: the kernel parses the STE and command
-/// formats, not the VMM. This is simpler and forward-compatible with new
-/// command variants.
+/// The SMMU emulator owns the SMMUv3 spec: it parses and validates the guest
+/// STE and dispatches a decoded [`StreamConfig`] to the backend, which only
+/// maps each variant onto host IOMMU operations. TLBI commands are forwarded
+/// as raw bytes because the host kernel — not the VMM — parses them.
 pub trait AcceleratedStreamBackend: Send + Sync {
-    /// Guest wrote `CFGI_STE` for this stream. The 64-byte STE is read from
-    /// guest memory by the caller.
+    /// The guest reconfigured this stream's STE (via `CFGI_STE`). The emulator
+    /// has already parsed and validated the STE into `config`.
     ///
     /// `sid` is the stream ID from the CMDQ command, used for lazy vDevice
     /// allocation (the virtual stream ID is not known at construction time).
-    ///
-    /// The backend dispatches on `STE.Config`:
-    /// - `ABORT` (0): detach from nested HWPT, attach abort HWPT
-    /// - `BYPASS` (4): detach from nested HWPT, attach bypass HWPT
-    /// - `S1_TRANS` (5): mask STE DW0-1, call `IOMMU_HWPT_ALLOC` nested
-    fn on_cfgi_ste(&self, sid: u32, ste_bytes: &[u8; 64]) -> anyhow::Result<()>;
+    fn set_stream_config(&self, sid: u32, config: StreamConfig) -> anyhow::Result<()>;
 
     /// Guest issued a TLBI command. The raw 16-byte command entry is
     /// forwarded to iommufd via `IOMMU_HWPT_INVALIDATE`. The kernel
     /// parses the opcode and operands.
     fn on_tlbi(&self, cmd_bytes: &[u8; 16]) -> anyhow::Result<()>;
+}
+
+/// A decoded stream (STE) configuration the SMMU emulator dispatches to an
+/// [`AcceleratedStreamBackend`].
+///
+/// The emulator decodes the guest's STE (validity and `STE.Config`) into one
+/// of these variants so the backend never has to interpret raw STE bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamConfig {
+    /// Abort all transactions. Produced for an invalid STE (`V=0`),
+    /// `Config=ABORT`, or any config the emulator does not support in
+    /// accelerated mode.
+    Abort,
+    /// Bypass translation (`Config=BYPASS`) — identity GPA→HPA via the
+    /// nesting parent (S2) HWPT.
+    Bypass,
+    /// Stage-1 translation (`Config=S1_TRANS`). Carries the STE double-words
+    /// reduced to the fields the host nesting path accepts.
+    Translate {
+        /// Masked `[DW0, DW1]` ready to hand to `IOMMU_HWPT_ALLOC`.
+        nested_ste: [u64; 2],
+    },
+}
+
+impl StreamConfig {
+    /// Decode a guest STE into the accelerated-stream action.
+    ///
+    /// Centralizes the SMMUv3 spec decisions (V-bit handling, `Config`
+    /// dispatch, the nesting field selection) so backends consume only the
+    /// resulting intent.
+    pub(crate) fn from_ste(ste: &crate::spec::ste::Ste) -> Self {
+        use crate::spec::ste::SteConfig;
+
+        if !ste.valid() {
+            return Self::Abort;
+        }
+        match ste.config() {
+            SteConfig::ABORT => Self::Abort,
+            SteConfig::BYPASS => Self::Bypass,
+            SteConfig::S1_TRANS => Self::Translate {
+                nested_ste: ste.nesting_dwords(),
+            },
+            other => {
+                tracelimit::warn_ratelimited!(
+                    config = other.0,
+                    "smmu: unsupported STE config for accelerated stream; treating as abort"
+                );
+                Self::Abort
+            }
+        }
+    }
 }
 
 /// Registration entry for a VFIO device with iommufd-accelerated translation.
