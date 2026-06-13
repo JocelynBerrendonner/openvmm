@@ -448,15 +448,57 @@ impl SmmuSharedState {
         Ok(())
     }
 
-    /// Updates the SMMU enable state (called by SmmuDevice on CR0 writes).
-    pub fn set_enabled(&self, enabled: bool) {
+    /// Updates the SMMU enable state (called by SmmuDevice on CR0 writes) and
+    /// atomically re-drives accelerated backends to the new policy.
+    ///
+    /// The state write and the re-drive happen under a single `policy_lock`
+    /// acquisition, so the transition is atomic with respect to device
+    /// registration and other policy changes: a backend can never observe a
+    /// half-updated view and apply a stale policy that then "wins".
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        let _policy = self.policy_lock.lock();
         self.inner.write().enabled = enabled;
+        self.apply_all_locked();
     }
 
     /// Updates the mirrored `GBPA.ABORT` state (called by SmmuDevice on GBPA
-    /// writes). Selects the disabled-state policy (abort vs bypass).
+    /// writes) and atomically re-drives accelerated backends to the new
+    /// policy. Selects the disabled-state policy (abort vs bypass).
+    ///
+    /// Like [`set_enabled`](Self::set_enabled), the write and the re-drive are
+    /// a single `policy_lock` critical section.
     pub(crate) fn set_gbpa_abort(&self, abort: bool) {
+        let _policy = self.policy_lock.lock();
         self.inner.write().gbpa_abort = abort;
+        self.apply_all_locked();
+    }
+
+    /// Atomically replaces all policy-relevant translation state (enable,
+    /// `GBPA.ABORT`, stream table base/size) and re-drives accelerated
+    /// backends to the resulting policy, in a single `policy_lock` critical
+    /// section.
+    ///
+    /// Used on device reset and state restore, where several policy inputs
+    /// change together: applying them as one atomic transition (rather than a
+    /// sequence of single-field updates) avoids transient intermediate
+    /// policies and any ordering fragility around when the final re-drive
+    /// observes fully-consistent state.
+    pub(crate) fn sync_translation_state(
+        &self,
+        enabled: bool,
+        gbpa_abort: bool,
+        strtab_base: u64,
+        strtab_log2size: u8,
+    ) {
+        let _policy = self.policy_lock.lock();
+        {
+            let mut inner = self.inner.write();
+            inner.enabled = enabled;
+            inner.gbpa_abort = gbpa_abort;
+            inner.strtab_base = strtab_base;
+            inner.strtab_log2size = strtab_log2size;
+        }
+        self.apply_all_locked();
     }
 
     /// Updates the stream table configuration (called by SmmuDevice on
@@ -788,11 +830,23 @@ impl SmmuSharedState {
     /// Re-computes and applies the current policy for every registered
     /// accelerated backend.
     ///
-    /// Used on events that change policy globally: `GBPA` writes,
-    /// `CR0.SMMUEN` transitions, and `CFGI_STE_RANGE` / `CFGI_ALL`.
+    /// Used on events that change policy globally without otherwise mutating
+    /// translation state: `CFGI_STE_RANGE` / `CFGI_ALL`. (The state-mutating
+    /// events — CR0/GBPA writes, reset, restore — re-drive atomically via
+    /// [`set_enabled`](Self::set_enabled),
+    /// [`set_gbpa_abort`](Self::set_gbpa_abort), and
+    /// [`sync_translation_state`](Self::sync_translation_state).)
     /// Serialized via the policy lock.
     pub(crate) fn apply_all_stream_configs(&self) {
         let _policy = self.policy_lock.lock();
+        self.apply_all_locked();
+    }
+
+    /// Re-drives every registered backend to its current policy. The caller
+    /// must already hold `policy_lock` (this is the shared body of
+    /// [`apply_all_stream_configs`](Self::apply_all_stream_configs) and the
+    /// state-mutating setters).
+    fn apply_all_locked(&self) {
         for (sid, backend) in self.stream_backend_entries() {
             let config = self.current_stream_config(sid);
             if let Err(e) = backend.set_stream_config(config) {

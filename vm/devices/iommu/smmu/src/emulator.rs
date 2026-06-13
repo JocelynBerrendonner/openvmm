@@ -414,19 +414,15 @@ impl SmmuDevice {
             | registers::IRQ_CTRLACK => {}
 
             registers::CR0 => {
-                let prev_smmuen = self.cr0.smmuen();
                 self.cr0 = registers::Cr0::from(value);
                 // Immediate acknowledge — no async enable sequence.
                 self.cr0ack = self.cr0;
-                // Sync enable state to shared state for per-device wrappers.
-                self.shared_state.set_enabled(self.cr0.smmuen());
                 self.shared_state.set_evtq_enabled(self.cr0.eventqen());
-                // A SMMUEN transition flips the disabled-state policy
-                // (bypass/abort) to/from the per-stream STE policy; re-drive
-                // accelerated backends so they track the change.
-                if self.cr0.smmuen() != prev_smmuen {
-                    self.shared_state.apply_all_stream_configs();
-                }
+                // Sync enable state to shared state for per-device wrappers.
+                // This atomically re-drives accelerated backends, since a
+                // SMMUEN change flips the disabled-state policy (bypass/abort)
+                // to/from the per-stream STE policy.
+                self.shared_state.set_enabled(self.cr0.smmuen());
             }
             registers::CR1 => {
                 self.cr1 = registers::Cr1::from(value);
@@ -442,10 +438,9 @@ impl SmmuDevice {
                 self.gbpa = gbpa;
                 // GBPA.ABORT selects bypass vs abort while the SMMU is
                 // disabled. Mirror it into shared state (consulted by the
-                // non-accel translate path and the accel policy computation)
-                // and re-drive accelerated backends.
+                // non-accel translate path and the accel policy computation);
+                // this atomically re-drives accelerated backends.
                 self.shared_state.set_gbpa_abort(self.gbpa.abort());
-                self.shared_state.apply_all_stream_configs();
             }
             registers::IRQ_CTRL => {
                 self.irq_ctrl = registers::IrqCtrl::from(value);
@@ -893,17 +888,13 @@ impl ChangeDeviceState for SmmuDevice {
         *evtq_msi = MsiConfig::default();
         *cmdq_msi = MsiConfig::default();
 
-        // Sync disabled state to shared state so per-device wrappers
-        // bypass translation immediately.
-        shared_state.set_enabled(false);
-        shared_state.set_gbpa_abort(false);
-        shared_state.set_strtab(0, 0);
+        // Atomically reset the policy-relevant translation state (disabled,
+        // GBPA.ABORT=0 so DMA bypasses, stream table cleared) and re-drive
+        // accelerated backends to the post-reset policy (bypass).
+        shared_state.sync_translation_state(false, false, 0, 0);
         // Reset EVTQ state (prod, cons, config, enabled).
         // Reset GERROR state and deassert interrupt.
         shared_state.reset_queue_state();
-        // Re-drive accelerated backends to the post-reset policy (bypass,
-        // since the SMMU is disabled and GBPA.ABORT=0).
-        shared_state.apply_all_stream_configs();
     }
 }
 
@@ -1025,10 +1016,18 @@ impl SaveRestore for SmmuDevice {
         self.evtq_msi = evtq_msi.restore();
         self.cmdq_msi = cmdq_msi.restore();
 
-        // Re-sync derived state in SmmuSharedState.
-        self.shared_state.set_enabled(self.cr0.smmuen());
-        self.shared_state.set_gbpa_abort(self.gbpa.abort());
-        self.sync_strtab_to_shared();
+        // Re-sync derived state in SmmuSharedState. Apply the policy-relevant
+        // translation state (enable, GBPA.ABORT, stream table) as one atomic
+        // transition, which also re-drives accelerated backends to the
+        // restored policy.
+        let strtab_base = registers::StrtabBase::from(self.strtab_base).addr();
+        let strtab_log2size = self.strtab_base_cfg.log2size();
+        self.shared_state.sync_translation_state(
+            self.cr0.smmuen(),
+            self.gbpa.abort(),
+            strtab_base,
+            strtab_log2size,
+        );
         self.sync_evtq_to_shared();
         self.shared_state.set_evtq_enabled(self.cr0.eventqen());
         self.shared_state
@@ -1040,8 +1039,6 @@ impl SaveRestore for SmmuDevice {
                 gerror,
                 gerrorn,
             });
-        // Re-drive accelerated backends to the restored policy.
-        self.shared_state.apply_all_stream_configs();
 
         Ok(())
     }
