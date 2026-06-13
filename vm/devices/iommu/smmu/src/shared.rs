@@ -50,12 +50,13 @@ use zerocopy::IntoBytes;
 /// maps each variant onto host IOMMU operations. TLBI commands are forwarded
 /// as raw bytes because the host kernel — not the VMM — parses them.
 pub trait AcceleratedStreamBackend: Send + Sync {
-    /// The guest reconfigured this stream's STE (via `CFGI_STE`). The emulator
-    /// has already parsed and validated the STE into `config`.
-    ///
-    /// `sid` is the stream ID from the CMDQ command, used for lazy vDevice
-    /// allocation (the virtual stream ID is not known at construction time).
-    fn set_stream_config(&self, sid: u32, config: StreamConfig) -> anyhow::Result<()>;
+    /// The guest reconfigured this stream's STE (via `CFGI_STE`), or the
+    /// emulator recomputed the stream's policy (e.g. on a `GBPA` write or
+    /// `SMMUEN` transition). The emulator has already parsed and validated
+    /// the STE into `config`. Only [`StreamConfig::Translate`] carries a
+    /// stream ID (for lazy vDevice allocation); the bypass and abort cases
+    /// have no per-stream identity to act on.
+    fn set_stream_config(&self, config: StreamConfig) -> anyhow::Result<()>;
 
     /// Guest issued a TLBI command. The raw 16-byte command entry is
     /// forwarded to iommufd via `IOMMU_HWPT_INVALIDATE`. The kernel
@@ -77,21 +78,26 @@ pub enum StreamConfig {
     /// Bypass translation (`Config=BYPASS`) — identity GPA→HPA via the
     /// nesting parent (S2) HWPT.
     Bypass,
-    /// Stage-1 translation (`Config=S1_TRANS`). Carries the STE double-words
-    /// reduced to the fields the host nesting path accepts.
+    /// Stage-1 translation (`Config=S1_TRANS`). Carries the stream ID (for
+    /// lazy vDevice allocation) and the STE double-words reduced to the
+    /// fields the host nesting path accepts.
     Translate {
+        /// Stream ID this configuration applies to. Used by the backend to
+        /// allocate the iommufd vDevice (the virtual stream ID is not known
+        /// at backend construction time).
+        sid: u32,
         /// Masked `[DW0, DW1]` ready to hand to `IOMMU_HWPT_ALLOC`.
         nested_ste: [u64; 2],
     },
 }
 
 impl StreamConfig {
-    /// Decode a guest STE into the accelerated-stream action.
+    /// Decode a guest STE for stream `sid` into the accelerated-stream action.
     ///
     /// Centralizes the SMMUv3 spec decisions (V-bit handling, `Config`
     /// dispatch, the nesting field selection) so backends consume only the
     /// resulting intent.
-    pub(crate) fn from_ste(ste: &crate::spec::ste::Ste) -> Self {
+    pub(crate) fn from_ste(sid: u32, ste: &crate::spec::ste::Ste) -> Self {
         use crate::spec::ste::SteConfig;
 
         if !ste.valid() {
@@ -101,6 +107,7 @@ impl StreamConfig {
             SteConfig::ABORT => Self::Abort,
             SteConfig::BYPASS => Self::Bypass,
             SteConfig::S1_TRANS => Self::Translate {
+                sid,
                 nested_ste: ste.nesting_dwords(),
             },
             other => {
@@ -158,11 +165,18 @@ fn compose_stream_id(
 /// Result of an SMMU translation attempt.
 #[derive(Debug)]
 enum TranslateResult {
-    /// SMMU disabled or bus not yet assigned — bypass (IOVA = GPA).
+    /// SMMU disabled (with `GBPA.ABORT=0`) or bus not yet assigned — bypass
+    /// (IOVA = GPA).
     Bypass,
     /// Translated GPA.
     Translated(u64),
-    /// Abort — STE says to abort this stream's DMA.
+    /// Global abort: the SMMU is disabled with `GBPA.ABORT=1`. Per SMMUv3,
+    /// the transaction is terminated with an abort and **no** event record is
+    /// generated (there is no stream context to fault against). Distinct from
+    /// [`TranslateResult::Abort`], which is STE-driven and records an event.
+    GlobalAbort,
+    /// Abort — STE says to abort this stream's DMA. Records a `C_BAD_STE`
+    /// event.
     Abort(EvtEntry),
     /// Translation fault — event to queue.
     Fault(EvtEntry),
@@ -203,11 +217,23 @@ pub struct SmmuSharedState {
     /// The SID is derived dynamically from each entry's `AssignedBusRange`
     /// because bus numbers are guest-assigned after device construction.
     accel_devices: RwLock<Vec<AccelDeviceRegistration>>,
+    /// Serializes "compute current policy + apply to backend" for accelerated
+    /// streams. Both device registration (resolver/manager thread) and
+    /// CMDQ-driven re-config (vCPU thread) acquire this lock, so the two are
+    /// totally ordered and the last-applied stream config always reflects the
+    /// newest guest intent. Held across the backend ioctls (attach path, not
+    /// the DMA hot path); never nested inside the translation `inner` lock.
+    policy_lock: Mutex<()>,
 }
 
 struct SharedStateInner {
     /// Whether the SMMU is enabled (CR0.SMMUEN).
     enabled: bool,
+    /// Mirror of `GBPA.ABORT`, kept in sync on GBPA writes. Selects the
+    /// disabled-state policy: when the SMMU is disabled, `true` aborts all
+    /// transactions and `false` bypasses (IOVA = GPA). Consulted by both the
+    /// non-accel translate path and the accel policy computation.
+    gbpa_abort: bool,
     /// Stream table base address.
     strtab_base: u64,
     /// Stream table log2 size (number of entries).
@@ -289,6 +315,7 @@ impl SmmuSharedState {
         Arc::new(Self {
             inner: RwLock::new(SharedStateInner {
                 enabled: false,
+                gbpa_abort: false,
                 strtab_base: 0,
                 strtab_log2size: 0,
                 oas_bits,
@@ -312,6 +339,7 @@ impl SmmuSharedState {
             accel,
             oas_policy,
             accel_devices: RwLock::new(Vec::new()),
+            policy_lock: Mutex::new(()),
         })
     }
 
@@ -423,6 +451,12 @@ impl SmmuSharedState {
     /// Updates the SMMU enable state (called by SmmuDevice on CR0 writes).
     pub fn set_enabled(&self, enabled: bool) {
         self.inner.write().enabled = enabled;
+    }
+
+    /// Updates the mirrored `GBPA.ABORT` state (called by SmmuDevice on GBPA
+    /// writes). Selects the disabled-state policy (abort vs bypass).
+    pub(crate) fn set_gbpa_abort(&self, abort: bool) {
+        self.inner.write().gbpa_abort = abort;
     }
 
     /// Updates the stream table configuration (called by SmmuDevice on
@@ -614,17 +648,161 @@ impl SmmuSharedState {
     /// fixed at registration time. When the guest writes `CFGI_STE` or
     /// TLBI commands, the emulator matches the command's SID against
     /// each registered device's current bus assignment.
+    ///
+    /// Registration is atomic with applying the SMMU's *current* policy to the
+    /// new device (under the policy lock), so a freshly attached device lands
+    /// in the correct boot state instead of staying fail-closed (detached).
+    /// At boot the SMMU is disabled, so the policy is bypass-or-abort per
+    /// `GBPA.ABORT` and is independent of the StreamID — it is applied even
+    /// before the guest has assigned this device's bus number. Once the SMMU
+    /// is enabled the policy depends on the per-stream STE; if the bus is not
+    /// yet assigned the device is left fail-closed until the guest enumerates
+    /// and issues `CFGI_STE`.
     pub fn register_accel_device(
         &self,
         bus_range: AssignedBusRange,
         stream_id_base: u32,
         backend: Arc<dyn AcceleratedStreamBackend>,
     ) {
+        let _policy = self.policy_lock.lock();
         self.accel_devices.write().push(AccelDeviceRegistration {
-            bus_range,
+            bus_range: bus_range.clone(),
             stream_id_base,
-            backend,
+            backend: backend.clone(),
         });
+
+        // Catch the new device up to the current policy.
+        //
+        // If the bus is assigned, compute the stream-specific policy. If not,
+        // fall back to the disabled-state (StreamID-independent) policy — this
+        // is what lets a boot device reach bypass/abort before the guest has
+        // enumerated it. With the SMMU enabled and no bus yet, there is no
+        // policy to apply: leave the device fail-closed until its `CFGI_STE`.
+        let config = match compose_stream_id(&bus_range, stream_id_base, None) {
+            Some(sid) => self.current_stream_config(sid),
+            None => match self.disabled_policy() {
+                Some(config) => config,
+                None => return,
+            },
+        };
+        if let Err(e) = backend.set_stream_config(config) {
+            tracelimit::warn_ratelimited!(
+                error = &*e as &dyn std::error::Error,
+                "smmu: failed to apply initial stream config on register"
+            );
+        }
+    }
+
+    /// Computes the SMMU's current policy for the given stream.
+    ///
+    /// This is the single source of truth for a stream's accelerated policy:
+    /// when the SMMU is disabled the result is `GBPA.ABORT ? Abort : Bypass`;
+    /// when enabled the STE for `sid` is read from guest memory and decoded.
+    ///
+    /// The translation (`inner`) lock is only held to snapshot register state;
+    /// it is released before the STE read so callers can apply the result to a
+    /// backend (a blocking ioctl) without nesting the translation lock around
+    /// it.
+    pub(crate) fn current_stream_config(&self, sid: u32) -> StreamConfig {
+        let (enabled, gbpa_abort, strtab_base, strtab_log2size) = {
+            let inner = self.inner.read();
+            (
+                inner.enabled,
+                inner.gbpa_abort,
+                inner.strtab_base,
+                inner.strtab_log2size,
+            )
+        };
+
+        if !enabled {
+            return if gbpa_abort {
+                StreamConfig::Abort
+            } else {
+                StreamConfig::Bypass
+            };
+        }
+
+        // SMMU enabled: read and decode this stream's STE.
+        let max_streams = 1u64 << strtab_log2size;
+        if (sid as u64) >= max_streams {
+            tracelimit::warn_ratelimited!(
+                sid,
+                max_streams,
+                "smmu: current_stream_config for out-of-range SID; aborting"
+            );
+            return StreamConfig::Abort;
+        }
+        let ste_addr = strtab_base + (sid as u64) * (crate::spec::ste::STE_SIZE as u64);
+        match self
+            .guest_memory
+            .read_plain::<crate::spec::ste::Ste>(ste_addr)
+        {
+            Ok(ste) => StreamConfig::from_ste(sid, &ste),
+            Err(e) => {
+                tracelimit::warn_ratelimited!(
+                    error = &e as &dyn std::error::Error,
+                    ste_addr,
+                    sid,
+                    "smmu: failed to read STE for current_stream_config; aborting"
+                );
+                StreamConfig::Abort
+            }
+        }
+    }
+
+    /// Returns the StreamID-independent policy that applies while the SMMU is
+    /// disabled (`Some(Bypass)` or `Some(Abort)` per `GBPA.ABORT`), or `None`
+    /// when the SMMU is enabled (the policy then depends on the per-stream
+    /// STE).
+    fn disabled_policy(&self) -> Option<StreamConfig> {
+        let inner = self.inner.read();
+        (!inner.enabled).then(|| {
+            if inner.gbpa_abort {
+                StreamConfig::Abort
+            } else {
+                StreamConfig::Bypass
+            }
+        })
+    }
+
+    /// Re-computes and applies the current policy for a single stream's
+    /// accelerated backend (if one is registered).
+    ///
+    /// Serialized against registration and other policy updates via the
+    /// policy lock so the last write wins. Used for `CFGI_STE`.
+    pub(crate) fn apply_stream_config(&self, sid: u32) {
+        let _policy = self.policy_lock.lock();
+        let Some(backend) = self.get_stream_backend(sid) else {
+            return;
+        };
+        let config = self.current_stream_config(sid);
+        if let Err(e) = backend.set_stream_config(config) {
+            tracelimit::warn_ratelimited!(
+                error = &*e as &dyn std::error::Error,
+                sid,
+                "smmu: failed to apply stream config"
+            );
+        }
+    }
+
+    /// Re-computes and applies the current policy for every registered
+    /// accelerated backend.
+    ///
+    /// Used on events that change policy globally: `GBPA` writes,
+    /// `CR0.SMMUEN` transitions, and `CFGI_STE_RANGE` / `CFGI_ALL`.
+    /// Serialized via the policy lock.
+    pub(crate) fn apply_all_stream_configs(&self) {
+        let _policy = self.policy_lock.lock();
+        for (sid, backend) in self.stream_backend_entries() {
+            let config = self.current_stream_config(sid);
+            if let Err(e) = backend.set_stream_config(config) {
+                tracelimit::warn_ratelimited!(
+                    error = &*e as &dyn std::error::Error,
+                    sid,
+                    "smmu: failed to apply stream config"
+                );
+            }
+        }
     }
 
     /// Look up the accelerated backend for a stream ID.
@@ -708,6 +886,14 @@ impl SmmuSharedState {
         write: bool,
     ) -> TranslateResult {
         if !inner.enabled {
+            // The SMMU is disabled: GBPA selects the global policy. ABORT
+            // terminates the transaction (with no event — there is no stream
+            // context to fault against); otherwise transactions bypass
+            // (IOVA = GPA). The matching accel policy is computed in
+            // [`current_stream_config`].
+            if inner.gbpa_abort {
+                return TranslateResult::GlobalAbort;
+            }
             return TranslateResult::Bypass;
         }
 
@@ -874,6 +1060,16 @@ impl SmmuDmaFault {
             input_addr: event.input_addr,
         }
     }
+
+    /// A global abort (disabled SMMU, `GBPA.ABORT=1`). No event record is
+    /// generated, so `event_id` is 0 to signify "no event".
+    fn global_abort(sid: u32, input_addr: u64) -> Self {
+        Self {
+            event_id: 0,
+            sid,
+            input_addr,
+        }
+    }
 }
 
 impl iommu_common::IommuTranslator for SmmuTranslator {
@@ -902,6 +1098,14 @@ impl iommu_common::IommuTranslator for SmmuTranslator {
         let gpa = match self.shared.translate_locked(&inner, sid, iova, write) {
             TranslateResult::Bypass => iova,
             TranslateResult::Translated(gpa) => gpa,
+            TranslateResult::GlobalAbort => {
+                drop(inner);
+                // Disabled SMMU with GBPA.ABORT=1: terminate with no event.
+                return Err(iommu_common::TranslationFault {
+                    iova,
+                    error: SmmuDmaFault::global_abort(sid, iova),
+                });
+            }
             TranslateResult::Abort(event) | TranslateResult::Fault(event) => {
                 drop(inner);
                 let error = SmmuDmaFault::from_event(&event);
@@ -958,6 +1162,10 @@ impl SignalMsi for SmmuSignalMsi {
             }
             TranslateResult::Translated(gpa) => {
                 self.inner.signal_msi(devid, gpa, data);
+            }
+            TranslateResult::GlobalAbort => {
+                // Disabled SMMU with GBPA.ABORT=1: drop the MSI, no event.
+                tracelimit::warn_ratelimited!(sid, address, "smmu: MSI globally aborted (GBPA)");
             }
             TranslateResult::Abort(event) => {
                 self.shared.write_event(event);
@@ -1027,6 +1235,14 @@ impl IrqFdRoute for SmmuIrqFdRoute {
             }
             TranslateResult::Translated(gpa) => {
                 self.inner.enable(gpa, data, devid);
+            }
+            TranslateResult::GlobalAbort => {
+                // Disabled SMMU with GBPA.ABORT=1: drop the route, no event.
+                tracelimit::warn_ratelimited!(
+                    sid,
+                    address,
+                    "smmu: irqfd MSI route globally aborted (GBPA)"
+                );
             }
             TranslateResult::Abort(event) => {
                 self.shared.write_event(event);
@@ -1838,5 +2054,310 @@ mod tests {
         state.resolve_host_caps(compatible_host_caps()).unwrap();
         // Same caps again (another device behind the same physical SMMU).
         state.resolve_host_caps(compatible_host_caps()).unwrap();
+    }
+
+    // =========================================================================
+    // Disabled-state policy (GBPA.ABORT) tests
+    // =========================================================================
+
+    /// Non-accel: while the SMMU is disabled, DMA bypasses (IOVA = GPA) when
+    /// `GBPA.ABORT=0`.
+    #[test]
+    fn test_disabled_bypass_when_gbpa_abort_clear() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let data = b"disabled-bypass";
+        gm.write_at(0x3000, data).unwrap();
+
+        let state = SmmuSharedState::new(
+            gm.clone(),
+            40,
+            crate::SmmuOasPolicy::Fixed(40),
+            false,
+            None,
+            None,
+        );
+        // Disabled with GBPA.ABORT=0 (the reset default).
+        state.set_gbpa_abort(false);
+        // Enable the EVTQ so an (unexpected) abort would be observable.
+        state.set_evtq_config(EVTQ_BASE, EVTQ_LOG2SIZE);
+        state.set_evtq_enabled(true);
+
+        let bus_range = make_bus_range();
+        let mock_msi = MockSignalMsi::new();
+        let (translating_gm, _msi) =
+            device_context(&state, bus_range, TEST_STREAM_ID_BASE, &gm, mock_msi);
+
+        let mut buf = vec![0u8; data.len()];
+        translating_gm.read_at(0x3000, &mut buf).unwrap();
+        assert_eq!(&buf, data);
+        assert_eq!(evtq_event_count(&state), 0);
+    }
+
+    /// Non-accel: while the SMMU is disabled, DMA aborts when `GBPA.ABORT=1`.
+    /// Per SMMUv3 a global abort generates **no** event record (there is no
+    /// stream context to fault against), so the EVTQ stays empty even though
+    /// it is enabled.
+    #[test]
+    fn test_disabled_abort_when_gbpa_abort_set() {
+        let gm = GuestMemory::allocate(0x60_0000);
+
+        let state = SmmuSharedState::new(
+            gm.clone(),
+            40,
+            crate::SmmuOasPolicy::Fixed(40),
+            false,
+            None,
+            None,
+        );
+        // Disabled with GBPA.ABORT=1.
+        state.set_gbpa_abort(true);
+        state.set_evtq_config(EVTQ_BASE, EVTQ_LOG2SIZE);
+        state.set_evtq_enabled(true);
+
+        let bus_range = make_bus_range();
+        let mock_msi = MockSignalMsi::new();
+        let (translating_gm, _msi) =
+            device_context(&state, bus_range, TEST_STREAM_ID_BASE, &gm, mock_msi);
+
+        let mut buf = vec![0u8; 4];
+        translating_gm.read_at(0x3000, &mut buf).unwrap_err();
+        // A global (GBPA) abort generates no event record.
+        assert_eq!(evtq_event_count(&state), 0);
+    }
+
+    // =========================================================================
+    // current_stream_config tests
+    // =========================================================================
+
+    #[test]
+    fn test_current_stream_config_disabled_bypass() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = SmmuSharedState::new(
+            gm.clone(),
+            40,
+            crate::SmmuOasPolicy::Fixed(40),
+            true,
+            None,
+            None,
+        );
+        // Disabled, GBPA.ABORT=0 → Bypass, regardless of SID.
+        state.set_gbpa_abort(false);
+        assert_eq!(state.current_stream_config(0), StreamConfig::Bypass);
+        assert_eq!(state.current_stream_config(0x1234), StreamConfig::Bypass);
+    }
+
+    #[test]
+    fn test_current_stream_config_disabled_abort() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = SmmuSharedState::new(
+            gm.clone(),
+            40,
+            crate::SmmuOasPolicy::Fixed(40),
+            true,
+            None,
+            None,
+        );
+        // Disabled, GBPA.ABORT=1 → Abort, regardless of SID.
+        state.set_gbpa_abort(true);
+        assert_eq!(state.current_stream_config(0), StreamConfig::Abort);
+        assert_eq!(state.current_stream_config(0x1234), StreamConfig::Abort);
+    }
+
+    #[test]
+    fn test_current_stream_config_enabled_reads_ste() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let sid = expected_sid();
+        let state = make_shared_state(&gm);
+
+        // Valid S1_TRANS STE → Translate, carrying this SID.
+        write_ste(&gm, sid, &make_s1_ste(CD_BASE));
+        assert!(matches!(
+            state.current_stream_config(sid),
+            StreamConfig::Translate { sid: s, .. } if s == sid
+        ));
+
+        // Bypass STE → Bypass.
+        write_ste(&gm, sid, &make_bypass_ste());
+        assert_eq!(state.current_stream_config(sid), StreamConfig::Bypass);
+
+        // Abort STE → Abort.
+        write_ste(&gm, sid, &make_abort_ste());
+        assert_eq!(state.current_stream_config(sid), StreamConfig::Abort);
+
+        // Invalid STE (V=0) → Abort.
+        write_ste(
+            &gm,
+            sid,
+            &Ste {
+                qw0: SteDw0::new().with_v(false),
+                qw1: SteDw1::new(),
+                _qw2_7: [0; 6],
+            },
+        );
+        assert_eq!(state.current_stream_config(sid), StreamConfig::Abort);
+    }
+
+    #[test]
+    fn test_current_stream_config_out_of_range_sid_aborts() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = make_shared_state(&gm);
+        // strtab has 2^STRTAB_LOG2SIZE entries; an SID past the end aborts.
+        let oob_sid = 1u32 << STRTAB_LOG2SIZE;
+        assert_eq!(state.current_stream_config(oob_sid), StreamConfig::Abort);
+    }
+
+    // =========================================================================
+    // register_accel_device initial-policy tests
+    // =========================================================================
+
+    /// A mock accel backend that records the configs applied to it.
+    struct MockBackend {
+        configs: Mutex<Vec<StreamConfig>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                configs: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn take(&self) -> Vec<StreamConfig> {
+            std::mem::take(&mut *self.configs.lock())
+        }
+    }
+
+    impl AcceleratedStreamBackend for MockBackend {
+        fn set_stream_config(&self, config: StreamConfig) -> anyhow::Result<()> {
+            self.configs.lock().push(config);
+            Ok(())
+        }
+
+        fn on_tlbi(&self, _cmd_bytes: &[u8; 16]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_accel_shared(gm: &GuestMemory) -> Arc<SmmuSharedState> {
+        SmmuSharedState::new(
+            gm.clone(),
+            40,
+            crate::SmmuOasPolicy::Fixed(40),
+            true,
+            None,
+            None,
+        )
+    }
+
+    /// Registering a device while the SMMU is disabled (GBPA.ABORT=0) applies
+    /// Bypass immediately, even before the bus is assigned.
+    #[test]
+    fn test_register_applies_bypass_when_disabled() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = make_accel_shared(&gm);
+        state.set_gbpa_abort(false);
+
+        let backend = MockBackend::new();
+        // Bus not yet assigned.
+        let bus_range = AssignedBusRange::new();
+        state.register_accel_device(bus_range, TEST_STREAM_ID_BASE, backend.clone());
+
+        let applied = backend.take();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0], StreamConfig::Bypass);
+    }
+
+    /// Registering a device while the SMMU is disabled (GBPA.ABORT=1) applies
+    /// Abort immediately.
+    #[test]
+    fn test_register_applies_abort_when_disabled_gbpa_abort() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = make_accel_shared(&gm);
+        state.set_gbpa_abort(true);
+
+        let backend = MockBackend::new();
+        let bus_range = AssignedBusRange::new();
+        state.register_accel_device(bus_range, TEST_STREAM_ID_BASE, backend.clone());
+
+        let applied = backend.take();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0], StreamConfig::Abort);
+    }
+
+    /// Registering a device while the SMMU is enabled with an assigned bus
+    /// applies the stream's current STE-derived policy.
+    #[test]
+    fn test_register_applies_ste_policy_when_enabled() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = make_accel_shared(&gm);
+        state.set_strtab(STRTAB_BASE, STRTAB_LOG2SIZE);
+        state.set_enabled(true);
+
+        let sid = expected_sid();
+        write_ste(&gm, sid, &make_bypass_ste());
+
+        let backend = MockBackend::new();
+        let bus_range = make_bus_range(); // assigned
+        state.register_accel_device(bus_range, TEST_STREAM_ID_BASE, backend.clone());
+
+        let applied = backend.take();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0], StreamConfig::Bypass);
+    }
+
+    /// Registering a device while the SMMU is enabled but the bus is not yet
+    /// assigned leaves the device fail-closed (no initial apply); a later
+    /// CFGI_STE (apply_stream_config) catches it up.
+    #[test]
+    fn test_register_enabled_unassigned_bus_then_cfgi() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = make_accel_shared(&gm);
+        state.set_strtab(STRTAB_BASE, STRTAB_LOG2SIZE);
+        state.set_enabled(true);
+
+        let backend = MockBackend::new();
+        let bus_range = AssignedBusRange::new(); // unassigned
+        state.register_accel_device(bus_range.clone(), TEST_STREAM_ID_BASE, backend.clone());
+        // No config applied yet (fail-closed / detached).
+        assert!(backend.take().is_empty());
+
+        // Guest assigns the bus and programs the STE, then issues CFGI_STE.
+        bus_range.set_bus_range(TEST_BUS, TEST_BUS);
+        let sid = expected_sid();
+        write_ste(&gm, sid, &make_s1_ste(CD_BASE));
+        state.apply_stream_config(sid);
+
+        let applied = backend.take();
+        assert_eq!(applied.len(), 1);
+        assert!(
+            matches!(applied[0], StreamConfig::Translate { sid: s, .. } if s == sid),
+            "expected Translate for sid {sid:#x}, got {:?}",
+            applied[0]
+        );
+    }
+
+    /// apply_all_stream_configs re-drives every registered backend (used for
+    /// GBPA writes, SMMUEN transitions, and CFGI_ALL).
+    #[test]
+    fn test_apply_all_stream_configs_redrives() {
+        let gm = GuestMemory::allocate(0x60_0000);
+        let state = make_accel_shared(&gm);
+        state.set_strtab(STRTAB_BASE, STRTAB_LOG2SIZE);
+        state.set_gbpa_abort(false);
+
+        let backend = MockBackend::new();
+        let bus_range = make_bus_range();
+        state.register_accel_device(bus_range, TEST_STREAM_ID_BASE, backend.clone());
+        // Initial register applied Bypass (disabled, GBPA.ABORT=0).
+        assert_eq!(backend.take().last().copied(), Some(StreamConfig::Bypass));
+
+        // Enable the SMMU and program an abort STE, then re-drive.
+        let sid = expected_sid();
+        write_ste(&gm, sid, &make_abort_ste());
+        state.set_enabled(true);
+        state.apply_all_stream_configs();
+
+        let applied = backend.take();
+        assert_eq!(applied.last().copied(), Some(StreamConfig::Abort));
     }
 }

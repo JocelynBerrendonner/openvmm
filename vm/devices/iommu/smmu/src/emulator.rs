@@ -10,7 +10,6 @@ use crate::spec::commands::CmdOpcode;
 use crate::spec::commands::CmdSync;
 use crate::spec::commands::SyncCs;
 use crate::spec::registers;
-use crate::spec::ste::Ste;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
@@ -263,8 +262,13 @@ impl SmmuDevice {
             .with_gran16k(false)
             .with_gran64k(false);
 
-        // GBPA defaults to ABORT=1 (abort all transactions when SMMU is disabled).
-        let gbpa = registers::Gbpa::new().with_abort(true);
+        // GBPA resets to ABORT=0, so DMA bypasses (IOVA = GPA) while the SMMU
+        // is disabled. This preserves boot-time passthrough for direct-boot
+        // and UEFI, which use assigned devices before the guest enables the
+        // SMMU. The non-accel translate path and the accel policy computation
+        // both consult GBPA.ABORT for the disabled state, so leaving it set
+        // here would fail-close at boot.
+        let gbpa = registers::Gbpa::new().with_abort(false);
 
         let shared_state = SmmuSharedState::new(
             guest_memory.clone(),
@@ -274,6 +278,9 @@ impl SmmuDevice {
             evtq_irq,
             gerror_irq,
         );
+        // Keep the shared state's mirror of GBPA.ABORT in sync with the
+        // register's reset value.
+        shared_state.set_gbpa_abort(gbpa.abort());
 
         SmmuDevice {
             mmio_region: (
@@ -407,12 +414,19 @@ impl SmmuDevice {
             | registers::IRQ_CTRLACK => {}
 
             registers::CR0 => {
+                let prev_smmuen = self.cr0.smmuen();
                 self.cr0 = registers::Cr0::from(value);
                 // Immediate acknowledge — no async enable sequence.
                 self.cr0ack = self.cr0;
                 // Sync enable state to shared state for per-device wrappers.
                 self.shared_state.set_enabled(self.cr0.smmuen());
                 self.shared_state.set_evtq_enabled(self.cr0.eventqen());
+                // A SMMUEN transition flips the disabled-state policy
+                // (bypass/abort) to/from the per-stream STE policy; re-drive
+                // accelerated backends so they track the change.
+                if self.cr0.smmuen() != prev_smmuen {
+                    self.shared_state.apply_all_stream_configs();
+                }
             }
             registers::CR1 => {
                 self.cr1 = registers::Cr1::from(value);
@@ -426,6 +440,12 @@ impl SmmuDevice {
                 let mut gbpa = registers::Gbpa::from(value);
                 gbpa.set_update(false);
                 self.gbpa = gbpa;
+                // GBPA.ABORT selects bypass vs abort while the SMMU is
+                // disabled. Mirror it into shared state (consulted by the
+                // non-accel translate path and the accel policy computation)
+                // and re-drive accelerated backends.
+                self.shared_state.set_gbpa_abort(self.gbpa.abort());
+                self.shared_state.apply_all_stream_configs();
             }
             registers::IRQ_CTRL => {
                 self.irq_ctrl = registers::IrqCtrl::from(value);
@@ -663,27 +683,23 @@ impl SmmuDevice {
             };
 
             match entry.opcode() {
-                // Configuration invalidation: CFGI_STE — forward to backend if registered.
+                // Configuration invalidation: CFGI_STE — re-drive the
+                // backend (if any) to the stream's current policy.
                 CmdOpcode::CFGI_STE => {
                     let cmd = CmdCfgiSte::from(entry.qw0);
-                    let sid = cmd.sid();
-                    if let Some(backend) = self.shared_state.get_stream_backend(sid) {
-                        self.dispatch_cfgi_ste(sid, &*backend);
-                    }
-                    // Emulated devices: no-op (no STE cache).
+                    // Emulated devices: no-op (no STE cache). Accelerated
+                    // streams: the emulator re-reads and re-applies the STE.
+                    self.shared_state.apply_stream_config(cmd.sid());
                 }
 
-                // CFGI_STE_RANGE: forward each matching backend.
+                // CFGI_STE_RANGE: re-drive every registered backend.
                 CmdOpcode::CFGI_STE_RANGE => {
                     // When Range=31 (CFGI_ALL), all backends get notified.
                     // For other ranges, we'd need to iterate the SID range,
                     // but Range=31 is the only value Linux uses at init.
                     // For now, treat all ranges as broadcast to all backends.
-                    // For CFGI_ALL, re-read each backend's STE. Empty for
-                    // emulated-only configurations (loop is a no-op).
-                    for (sid, backend) in self.shared_state.stream_backend_entries() {
-                        self.dispatch_cfgi_ste(sid, &*backend);
-                    }
+                    // Empty for emulated-only configurations (loop is a no-op).
+                    self.shared_state.apply_all_stream_configs();
                 }
 
                 // Configuration invalidation: CFGI_CD — no-op for emulated devices.
@@ -790,45 +806,6 @@ impl SmmuDevice {
         self.shared_state.toggle_cmdq_err();
     }
 
-    /// Read the STE for `sid` from guest memory, decode it, and forward the
-    /// resulting [`StreamConfig`](crate::shared::StreamConfig) to the
-    /// accelerated backend.
-    fn dispatch_cfgi_ste(&self, sid: u32, backend: &dyn crate::shared::AcceleratedStreamBackend) {
-        let (strtab_base, strtab_log2size) = self.shared_state.strtab_config();
-        let max_streams = 1u64 << strtab_log2size;
-        if (sid as u64) >= max_streams {
-            tracelimit::warn_ratelimited!(
-                sid,
-                max_streams,
-                "smmu: CFGI_STE for out-of-range SID (accelerated)"
-            );
-            return;
-        }
-
-        let ste_addr = strtab_base + (sid as u64) * (size_of::<Ste>() as u64);
-        let ste = match self.guest_memory.read_plain::<Ste>(ste_addr) {
-            Ok(ste) => ste,
-            Err(e) => {
-                tracelimit::warn_ratelimited!(
-                    error = &e as &dyn std::error::Error,
-                    ste_addr,
-                    sid,
-                    "smmu: failed to read STE for accelerated CFGI_STE"
-                );
-                return;
-            }
-        };
-
-        let config = crate::shared::StreamConfig::from_ste(&ste);
-        if let Err(e) = backend.set_stream_config(sid, config) {
-            tracelimit::warn_ratelimited!(
-                error = &*e as &dyn std::error::Error,
-                sid,
-                "smmu: accelerated CFGI_STE failed"
-            );
-        }
-    }
-
     // =========================================================================
     // Event Queue
     // =========================================================================
@@ -896,7 +873,9 @@ impl ChangeDeviceState for SmmuDevice {
         *cr0ack = registers::Cr0::new();
         *cr1 = registers::Cr1::new();
         *cr2 = registers::Cr2::new();
-        *gbpa = registers::Gbpa::new().with_abort(true);
+        // GBPA resets to ABORT=0 (disabled-state DMA bypasses), matching the
+        // power-on default and preserving boot-time passthrough.
+        *gbpa = registers::Gbpa::new().with_abort(false);
 
         *irq_ctrl = registers::IrqCtrl::new();
         *irq_ctrlack = registers::IrqCtrl::new();
@@ -917,10 +896,14 @@ impl ChangeDeviceState for SmmuDevice {
         // Sync disabled state to shared state so per-device wrappers
         // bypass translation immediately.
         shared_state.set_enabled(false);
+        shared_state.set_gbpa_abort(false);
         shared_state.set_strtab(0, 0);
         // Reset EVTQ state (prod, cons, config, enabled).
         // Reset GERROR state and deassert interrupt.
         shared_state.reset_queue_state();
+        // Re-drive accelerated backends to the post-reset policy (bypass,
+        // since the SMMU is disabled and GBPA.ABORT=0).
+        shared_state.apply_all_stream_configs();
     }
 }
 
@@ -1044,6 +1027,7 @@ impl SaveRestore for SmmuDevice {
 
         // Re-sync derived state in SmmuSharedState.
         self.shared_state.set_enabled(self.cr0.smmuen());
+        self.shared_state.set_gbpa_abort(self.gbpa.abort());
         self.sync_strtab_to_shared();
         self.sync_evtq_to_shared();
         self.shared_state.set_evtq_enabled(self.cr0.eventqen());
@@ -1056,6 +1040,8 @@ impl SaveRestore for SmmuDevice {
                 gerror,
                 gerrorn,
             });
+        // Re-drive accelerated backends to the restored policy.
+        self.shared_state.apply_all_stream_configs();
 
         Ok(())
     }

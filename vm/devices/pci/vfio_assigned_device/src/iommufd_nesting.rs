@@ -187,8 +187,14 @@ impl IommufdStreamBackend {
     /// Create a new stream backend.
     ///
     /// `device_fd` must be a dup'd VFIO cdev fd (still bound to iommufd).
-    /// The device should already be attached to the S2 parent HWPT
-    /// (BYPASS mode) as its initial state.
+    ///
+    /// The device is detached (blocking domain = abort) immediately after
+    /// bind; this is the backend's initial internal state
+    /// (`current_nested_hwpt: None`). The SMMU emulator drives the device to
+    /// its correct initial policy when it registers the backend (see
+    /// `SmmuSharedState::register_accel_device`): bypass (attach to the S2
+    /// parent HWPT) while the SMMU is disabled with `GBPA.ABORT=0`, or abort
+    /// otherwise.
     pub fn new(accel: Arc<SmmuAccelState>, dev_id: u32, device_fd: File) -> Self {
         Self {
             accel,
@@ -340,12 +346,12 @@ impl IommufdStreamBackend {
 }
 
 impl smmu::AcceleratedStreamBackend for IommufdStreamBackend {
-    fn set_stream_config(&self, sid: u32, config: smmu::StreamConfig) -> anyhow::Result<()> {
+    fn set_stream_config(&self, config: smmu::StreamConfig) -> anyhow::Result<()> {
         let mut state = self.state.lock();
         match config {
             smmu::StreamConfig::Abort => self.handle_abort(&mut state),
             smmu::StreamConfig::Bypass => self.handle_bypass(&mut state),
-            smmu::StreamConfig::Translate { nested_ste } => {
+            smmu::StreamConfig::Translate { sid, nested_ste } => {
                 self.handle_s1_translate(&mut state, nested_ste, sid)
             }
         }
