@@ -1068,24 +1068,34 @@ impl InitializedVm {
             .filter(|(bus, _)| matches!(bus, VirtioBus::Mmio))
             .count();
 
-        // On aarch64 Linux direct boot, start RAM at 1 GiB to avoid the low GPA
+        // On aarch64, the bulk of RAM is placed at 1 GiB to avoid the low GPA
         // region (128 MiB–129 MiB) that iommufd reserves for the host MSI
         // doorbell in IOVA space. Without this gap, iommufd identity-mapped DMA
         // for passthrough devices fails because it cannot allocate IOVAs in
         // that range.
         //
-        // FUTURE: this needs to be present for UEFI as well, but UEFI cannot
-        // only boot from low memory. Either:
-        //  1. Fix Linux to allow configuring the reserved IOVA range.
-        //  2. Fix UEFI to allow booting from >0.
-        //  3. Install a little bit of low memory, enough for UEFI to get to DXE
-        //     (which can run anywhere.)
-        let ram_start_address =
-            if cfg!(guest_arch = "aarch64") && matches!(cfg.load_mode, LoadMode::Linux { .. }) {
-                1024 * 1024 * 1024 // 1 GiB
-            } else {
+        // Linux direct boot can run entirely above 1 GiB (the loader places the
+        // kernel anywhere), so all of `0..1 GiB` is reserved. UEFI, however,
+        // requires RAM at GPA 0 to reach DXE, so when an IOMMU is configured a
+        // small low RAM window is left mapped at 0 and the bulk of RAM still
+        // resumes at 1 GiB. The window stays below the 128 MiB doorbell hole,
+        // which lands in the reserved `window..1 GiB` gap.
+        //
+        // The UEFI carve-out is gated on an IOMMU being configured (at least
+        // one `--iommu`, even with no VFIO devices attached), since that is the
+        // only case where the doorbell IOVA reservation matters.
+        let (ram_start_address, low_ram_window_size) = if cfg!(guest_arch = "aarch64") {
+            let start = 1024 * 1024 * 1024; // 1 GB for the bulk of RAM, for good memory alignment.
+            let low_window = if matches!(cfg.load_mode, LoadMode::Linux { .. }) {
                 0
+            } else {
+                // 32MB low window for UEFI to load.
+                32 * 1024 * 1024
             };
+            (start, low_window)
+        } else {
+            (0, 0)
+        };
 
         let vtl2_framebuffer_size = if cfg.vtl2_gfx {
             cfg.framebuffer
@@ -1102,6 +1112,7 @@ impl InitializedVm {
             virtio_mmio_count,
             vtl2_layout,
             ram_start_address,
+            low_ram_window_size,
             vtl2_framebuffer_size,
             physical_address_size,
         })

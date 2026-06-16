@@ -118,6 +118,15 @@ pub(super) struct MemoryLayoutInput<'a> {
     /// This is used on aarch64 Linux direct boot to avoid the low GPA region
     /// that conflicts with iommufd IOVA reservations.
     pub ram_start_address: u64,
+    /// Size of a low RAM window mapped at GPA 0, below `ram_start_address`.
+    /// When nonzero, this much of node 0's RAM is placed contiguously starting
+    /// at GPA 0 and only `low_ram_window_size..ram_start_address` is reserved.
+    /// This is used on aarch64 UEFI with an IOMMU configured so firmware can
+    /// reach DXE from low memory while the bulk of RAM still resumes at
+    /// `ram_start_address`, keeping RAM out of the iommufd MSI doorbell IOVA
+    /// hole. Must be zero unless `ram_start_address` is nonzero, and must be
+    /// smaller than node 0's RAM size.
+    pub low_ram_window_size: u64,
     /// Size in bytes of the VTL2 framebuffer mapping. When non-zero, a
     /// `PostMmio` allocation is created and the resolved GPA is returned in
     /// `ResolvedMemoryLayout::vtl2_framebuffer_gpa_base`.
@@ -139,6 +148,7 @@ pub(super) fn resolve_memory_layout(
     validate_node_mem_sizes(input.node_mem_sizes)?;
 
     let mut ram_ranges_by_node = vec![Vec::new(); input.node_mem_sizes.len()];
+    let mut low_ram_ranges = Vec::new();
     let mut pcie_root_complex_ranges = input
         .pcie_root_complexes
         .iter()
@@ -160,9 +170,23 @@ pub(super) fn resolve_memory_layout(
     // window; the caller-requested size may extend it lower.
     // Reserve low addresses so RAM starts above `ram_start_address`. This is
     // used on aarch64 Linux direct boot to skip the 128 MiB–129 MiB IOVA
-    // region that iommufd reserves for the host MSI doorbell.
+    // region that iommufd reserves for the host MSI doorbell. When a low RAM
+    // window is requested (aarch64 UEFI with an IOMMU), only the range above
+    // the window is reserved, so firmware keeps a contiguous block at GPA 0.
     if input.ram_start_address > 0 {
-        builder.reserve("low-ram-gap", MemoryRange::new(0..input.ram_start_address));
+        if input.low_ram_window_size >= input.ram_start_address {
+            bail!(
+                "low RAM window {:#x} must be smaller than ram_start_address {:#x}",
+                input.low_ram_window_size,
+                input.ram_start_address
+            );
+        }
+        builder.reserve(
+            "low-ram-gap",
+            MemoryRange::new(input.low_ram_window_size..input.ram_start_address),
+        );
+    } else if input.low_ram_window_size != 0 {
+        bail!("low RAM window requires a nonzero ram_start_address");
     }
 
     let arch_reserved = if cfg!(guest_arch = "x86_64") {
@@ -337,6 +361,27 @@ pub(super) fn resolve_memory_layout(
         );
     }
 
+    // Low RAM window: a small block of node 0's RAM placed contiguously at
+    // GPA 0 so firmware (UEFI) can reach DXE while the bulk of RAM resumes at
+    // `ram_start_address`. Requested before the per-node RAM so it is placed
+    // first (lowest free address) and lands at 0. Its bytes are carved out of
+    // node 0 below.
+    if input.low_ram_window_size > 0 {
+        if input.node_mem_sizes[0] <= input.low_ram_window_size {
+            bail!(
+                "low RAM window {:#x} must be smaller than node 0 RAM size {:#x}",
+                input.low_ram_window_size,
+                input.node_mem_sizes[0]
+            );
+        }
+        builder.ram(
+            "ram0-low",
+            &mut low_ram_ranges,
+            input.low_ram_window_size,
+            TWO_MB,
+        );
+    }
+
     // RAM request order is part of the NUMA compatibility contract: the first
     // request maps to vnode 0, the second to vnode 1, and so on. Memory-less
     // nodes (size 0) are skipped so the layout allocator never sees a
@@ -348,6 +393,14 @@ pub(super) fn resolve_memory_layout(
         .zip(input.node_mem_sizes)
         .enumerate()
     {
+        // The low RAM window is carved out of node 0; place only the remaining
+        // bulk here. The window itself is merged back into node 0 after
+        // allocation.
+        let ram_size = if vnode == 0 {
+            ram_size - input.low_ram_window_size
+        } else {
+            ram_size
+        };
         if ram_size == 0 {
             continue;
         }
@@ -445,10 +498,17 @@ pub(super) fn resolve_memory_layout(
         .into_iter()
         .enumerate()
         .flat_map(|(vnode, ranges)| {
-            ranges.into_iter().map(move |range| MemoryRangeWithNode {
-                range,
-                vnode: vnode as u32,
-            })
+            // The low RAM window belongs to node 0; prepend it so node 0's
+            // ranges stay sorted ([0..window] then the bulk above
+            // `ram_start_address`).
+            let prefix = std::mem::take(&mut low_ram_ranges);
+            prefix
+                .into_iter()
+                .chain(ranges)
+                .map(move |range| MemoryRangeWithNode {
+                    range,
+                    vnode: vnode as u32,
+                })
         })
         .collect::<Vec<_>>();
 
@@ -608,6 +668,7 @@ mod tests {
             virtio_mmio_count: 0,
             vtl2_layout,
             ram_start_address: 0,
+            low_ram_window_size: 0,
             vtl2_framebuffer_size: 0,
             physical_address_size: 46,
         }
@@ -651,6 +712,46 @@ mod tests {
         assert_eq!(actual.ram_size(), 2 * GB);
         // RAM starts at GPA 0 and fills upward.
         assert_eq!(actual.ram()[0].range.start(), 0);
+    }
+
+    #[test]
+    fn low_ram_window_keeps_doorbell_hole_clear() {
+        // aarch64 UEFI + IOMMU: a 16 MiB low window sits at GPA 0 and the bulk
+        // of RAM resumes at 1 GiB, leaving the 128 MiB–129 MiB iommufd MSI
+        // doorbell IOVA hole inside the reserved gap.
+        const WINDOW: u64 = 16 * MB;
+        let mut input = input(&[2 * GB], None);
+        input.ram_start_address = GB;
+        input.low_ram_window_size = WINDOW;
+        let actual = resolve(input);
+
+        // No RAM bytes are lost: the window comes out of node 0.
+        assert_eq!(actual.ram_size(), 2 * GB);
+
+        let ram = actual.ram();
+        // The low window is contiguous from GPA 0.
+        assert_eq!(ram[0].range, MemoryRange::new(0..WINDOW));
+        // The bulk resumes GB-aligned at 1 GiB.
+        assert_eq!(ram[1].range.start(), GB);
+        assert_eq!(ram[1].range.len(), 2 * GB - WINDOW);
+
+        // The doorbell hole must not be backed by RAM.
+        let doorbell = MemoryRange::new(0x800_0000..0x810_0000);
+        for r in ram {
+            assert!(
+                !r.range.overlaps(&doorbell),
+                "RAM {:?} overlaps doorbell hole {:?}",
+                r.range,
+                doorbell
+            );
+        }
+    }
+
+    #[test]
+    fn low_ram_window_requires_ram_start_address() {
+        let mut input = input(&[2 * GB], None);
+        input.low_ram_window_size = 16 * MB;
+        assert!(resolve_memory_layout(input).is_err());
     }
 
     #[test]
