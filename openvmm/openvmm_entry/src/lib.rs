@@ -1260,7 +1260,7 @@ async fn vm_config_from_command_line(
     } else if opt.uefi {
         use openvmm_defs::config::UefiConsoleMode;
 
-        with_hv = true;
+        with_hv = !opt.no_hv;
 
         let firmware = fs_err::File::open(
             (opt.uefi_firmware.0)
@@ -1290,6 +1290,7 @@ async fn vm_config_from_command_line(
             bios_guid,
             enable_vmbus: !opt.no_vmbus,
             force_dma_bounce: opt.uefi_force_dma_bounce,
+            enable_hv: !opt.no_hv,
         };
     } else {
         // Linux Direct

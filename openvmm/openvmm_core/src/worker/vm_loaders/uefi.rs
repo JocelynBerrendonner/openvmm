@@ -50,6 +50,11 @@ pub struct UefiLoadSettings {
     pub vmbus: bool,
     /// Force UEFI to bounce-buffer all DMA traffic.
     pub force_dma_bounce: bool,
+    /// Whether the hypervisor (HV#1) enlightenments are exposed to the guest.
+    /// When `false`, the firmware's `hv_disabled` flag is set so that the
+    /// firmware does not attempt to use hypervisor-specific facilities. This
+    /// is required to boot UEFI without hypervisor support (e.g. aarch64 KVM).
+    pub hv: bool,
 }
 
 /// All inputs needed by [`load_uefi`].
@@ -135,7 +140,8 @@ pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
         .with_default_boot_always_attempt(settings.default_boot_always_attempt)
         .with_vmbus_disabled(!settings.vmbus)
         .with_pci_resources_pre_assigned(true)
-        .with_force_dma_bounce_enabled(settings.force_dma_bounce);
+        .with_force_dma_bounce_enabled(settings.force_dma_bounce)
+        .with_hv_disabled(!settings.hv);
 
     let mut cfg = config::Blob::new();
     cfg.add(&config::BiosInformation {

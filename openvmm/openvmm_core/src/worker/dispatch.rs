@@ -3160,6 +3160,7 @@ impl LoadedVmInner {
                 bios_guid,
                 enable_vmbus,
                 force_dma_bounce,
+                enable_hv,
             } => {
                 let acpi_tables = [
                     // MADT
@@ -3192,6 +3193,7 @@ impl LoadedVmInner {
                     bios_guid,
                     vmbus: enable_vmbus,
                     force_dma_bounce,
+                    hv: enable_hv,
                 };
                 let regs =
                     super::vm_loaders::uefi::load_uefi(&super::vm_loaders::uefi::LoadUefiParams {
