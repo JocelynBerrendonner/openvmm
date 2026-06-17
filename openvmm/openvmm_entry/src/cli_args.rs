@@ -3413,7 +3413,7 @@ impl FromStr for PcieRemoteCli {
 
 /// CLI configuration for a VFIO-assigned PCI device.
 ///
-/// Syntax: `host=<bdf>,port=<name>[,iommu=<id>][,bar0=pt..bar5=pt]`
+/// Syntax: `host=<bdf>,port=<name>[,iommu=<id>][,barN=pt|barN=0x<addr>]`
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 pub struct VfioDeviceCli {
@@ -3424,9 +3424,8 @@ pub struct VfioDeviceCli {
     /// Optional iommufd context ID. When set, uses VFIO cdev + iommufd
     /// instead of the legacy group/container path.
     pub iommu: Option<String>,
-    /// Per-BAR passthrough flags. When `bar_pt[i]` is true, the virtual
-    /// BAR is pre-programmed with the physical BAR address (GPA = HPA).
-    pub bar_pt: [bool; 6],
+    /// Per-BAR pre-programming configuration.
+    pub bar_pt: [vfio_assigned_device_resources::BarPassthrough; 6],
 }
 
 #[cfg(target_os = "linux")]
@@ -3437,7 +3436,7 @@ impl FromStr for VfioDeviceCli {
         let mut host: Option<String> = None;
         let mut port: Option<String> = None;
         let mut iommu: Option<String> = None;
-        let mut bar_pt = [false; 6];
+        let mut bar_pt = [vfio_assigned_device_resources::BarPassthrough::None; 6];
 
         for kv in s.split(',') {
             let (key, value) = kv
@@ -3466,11 +3465,20 @@ impl FromStr for VfioDeviceCli {
                     iommu = Some(value.to_string());
                 }
                 "bar0" | "bar1" | "bar2" | "bar3" | "bar4" | "bar5" => {
-                    if value != "pt" {
-                        anyhow::bail!("--vfio: '{key}' only accepts 'pt' as a value");
-                    }
                     let idx: usize = key[3..].parse().unwrap();
-                    bar_pt[idx] = true;
+                    let cfg = if value == "pt" {
+                        vfio_assigned_device_resources::BarPassthrough::Sysfs
+                    } else if let Some(hex) = value.strip_prefix("0x") {
+                        let addr = u64::from_str_radix(hex, 16).with_context(|| {
+                            format!("--vfio: '{key}' has invalid hex address '{value}'")
+                        })?;
+                        vfio_assigned_device_resources::BarPassthrough::Address(addr)
+                    } else {
+                        anyhow::bail!(
+                            "--vfio: '{key}' expects 'pt' or a hex address like '0x...', got '{value}'"
+                        );
+                    };
+                    bar_pt[idx] = cfg;
                 }
                 _ => anyhow::bail!("unknown --vfio key: '{key}'"),
             }

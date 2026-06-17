@@ -41,6 +41,7 @@ use pci_core::spec::cfg_space::HeaderType00;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
+use vfio_assigned_device_resources::BarPassthrough;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
@@ -274,7 +275,7 @@ impl VfioAssignedPciDevice {
         register_mmio: &mut (dyn chipset_device::mmio::RegisterMmioIntercept + Send),
         msi_target: &MsiTarget,
         memory_mapper: &dyn MemoryMapper,
-        bar_pt: [bool; 6],
+        bar_pt: [BarPassthrough; 6],
     ) -> anyhow::Result<Self> {
         let driver = driver_source.simple();
         let retry = vfio_sys::VfioRetry::new(&driver, &pci_id);
@@ -313,7 +314,7 @@ impl VfioAssignedPciDevice {
         register_mmio: &mut (dyn chipset_device::mmio::RegisterMmioIntercept + Send),
         msi_target: &MsiTarget,
         memory_mapper: &dyn MemoryMapper,
-        bar_pt: [bool; 6],
+        bar_pt: [BarPassthrough; 6],
     ) -> anyhow::Result<Self> {
         let (device, binding) = cdev_binding.into_parts();
         Self::from_device(
@@ -335,7 +336,7 @@ impl VfioAssignedPciDevice {
         register_mmio: &mut (dyn chipset_device::mmio::RegisterMmioIntercept + Send),
         msi_target: &MsiTarget,
         memory_mapper: &dyn MemoryMapper,
-        bar_pt: [bool; 6],
+        bar_pt: [BarPassthrough; 6],
     ) -> anyhow::Result<Self> {
         let config_info = vfio_device
             .region_info(vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX)
@@ -722,8 +723,13 @@ fn page_size() -> u64 {
     vfio_sys::host_page_size()
 }
 
-/// Apply BAR passthrough: validate the `bar_pt` flags against the discovered
-/// BAR layout and overlay physical addresses from sysfs.
+/// Apply BAR passthrough: validate the per-BAR configuration against the
+/// discovered BAR layout and overlay physical addresses.
+///
+/// For [`BarPassthrough::Sysfs`] BARs the address is read from the host
+/// kernel's resource table; for [`BarPassthrough::Address`] BARs the
+/// caller-supplied physical address is used (needed for synthesized BARs
+/// such as `nvgrace-gpu`'s coherent-memory BAR, which has no sysfs entry).
 ///
 /// Rejects requests for unimplemented BARs (zero mask) and for the upper half
 /// of a 64-bit BAR pair (the lower BAR implicitly covers both halves).
@@ -731,15 +737,15 @@ fn apply_bar_passthrough(
     pci_id: &str,
     bar_flags: &[u32; 6],
     bar_masks: &[u32; 6],
-    bar_pt: &[bool; 6],
+    bar_pt: &[BarPassthrough; 6],
 ) -> anyhow::Result<[u32; 6]> {
-    if !bar_pt.iter().any(|&pt| pt) {
+    if bar_pt.iter().all(|c| matches!(c, BarPassthrough::None)) {
         return Ok(*bar_flags);
     }
 
     // Validate before reading sysfs.
     for i in 0..6 {
-        if !bar_pt[i] {
+        if matches!(bar_pt[i], BarPassthrough::None) {
             continue;
         }
         if bar_masks[i] == 0 {
@@ -754,31 +760,47 @@ fn apply_bar_passthrough(
         }
     }
 
-    // VFIO config space returns cleared BARs after device reset, so sysfs
-    // is the only reliable source of physical addresses.
-    let phys = read_physical_bar_addresses(pci_id)?;
+    // VFIO config space returns cleared BARs after device reset, so sysfs is
+    // the only reliable source of physical addresses for `Sysfs` BARs. Only
+    // read it if at least one BAR actually needs it.
+    let phys = if bar_pt.iter().any(|c| matches!(c, BarPassthrough::Sysfs)) {
+        Some(read_physical_bar_addresses(pci_id)?)
+    } else {
+        None
+    };
+
     let mut bars = *bar_flags;
     for i in 0..6 {
-        if bar_pt[i] {
-            let addr = phys[i];
-            if addr == 0 {
-                anyhow::bail!("BAR {i} passthrough requested but sysfs address is 0");
+        let addr = match bar_pt[i] {
+            BarPassthrough::None => continue,
+            BarPassthrough::Sysfs => {
+                let addr = phys.as_ref().expect("phys read when any Sysfs")[i];
+                if addr == 0 {
+                    anyhow::bail!("BAR {i} passthrough requested but sysfs address is 0");
+                }
+                addr
             }
-            let is_64bit = cfg_space::BarEncodingBits::from(bar_flags[i]).type_64_bit();
-            if !is_64bit && addr > u32::MAX as u64 {
-                anyhow::bail!("BAR {i} is 32-bit but sysfs address {addr:#x} exceeds 4 GB");
+            BarPassthrough::Address(addr) => {
+                if addr == 0 {
+                    anyhow::bail!("BAR {i} address override is 0");
+                }
+                addr
             }
-            bars[i] = (addr as u32 & !0xf) | bar_flags[i];
-            if is_64bit && i + 1 < 6 {
-                bars[i + 1] = (addr >> 32) as u32;
-            }
-            tracing::info!(
-                pci_id,
-                bar_index = i,
-                addr = format_args!("{:#x}", addr),
-                "passthrough BAR"
-            );
+        };
+        let is_64bit = cfg_space::BarEncodingBits::from(bar_flags[i]).type_64_bit();
+        if !is_64bit && addr > u32::MAX as u64 {
+            anyhow::bail!("BAR {i} is 32-bit but address {addr:#x} exceeds 4 GB");
         }
+        bars[i] = (addr as u32 & !0xf) | bar_flags[i];
+        if is_64bit && i + 1 < 6 {
+            bars[i + 1] = (addr >> 32) as u32;
+        }
+        tracing::info!(
+            pci_id,
+            bar_index = i,
+            addr = format_args!("{:#x}", addr),
+            "passthrough BAR"
+        );
     }
     Ok(bars)
 }

@@ -121,6 +121,11 @@ The `--vfio` value is a comma-separated list of `key=value` pairs:
 - `bar0=pt` through `bar5=pt` (optional) — pin the specified BAR to its
   physical host address (GPA = HPA); see [Peer-to-peer DMA](#peer-to-peer-dma)
   below
+- `bar0=0x<addr>` through `bar5=0x<addr>` (optional) — pin the specified BAR
+  to an explicit host physical address. Use this for BARs synthesized by a
+  VFIO variant driver (e.g. `nvgrace-gpu`'s coherent-memory BAR), whose
+  address is not exposed through sysfs; see
+  [Peer-to-peer DMA](#peer-to-peer-dma) below
 
 ```admonish tip
 You can assign multiple devices by adding more root ports and `--vfio` flags:
@@ -195,6 +200,16 @@ sudo openvmm \
   --vfio host=0000:01:00.0,port=rp0,bar0=pt \
   --vfio host=0000:02:00.0,port=rp1,bar0=pt \
   ...
+```
+
+For a BAR that is synthesized by a VFIO variant driver and has no sysfs
+resource entry, `bar<N>=pt` cannot discover the address. Supply it directly
+with `bar<N>=0x<addr>` instead. For example, the `nvgrace-gpu` driver exposes
+the GPU's CPU-coherent device memory as a fake 64-bit BAR4 whose host
+physical base comes from the `nvidia,gpu-mem-base-pa` ACPI `_DSD` property:
+
+```bash
+  --vfio host=0008:06:00.0,port=sw1-downstream-0,bar0=pt,bar2=pt,bar4=0x110000000000
 ```
 
 The `low_mmio_base=` and `high_mmio_base=` options pin the MMIO apertures
