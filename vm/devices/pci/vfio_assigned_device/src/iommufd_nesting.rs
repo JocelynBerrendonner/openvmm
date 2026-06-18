@@ -58,11 +58,7 @@ pub fn query_host_caps(ctx: &IommufdCtx, dev_id: u32) -> anyhow::Result<smmu::Ho
         aidr: 0,
     };
     let (data_type, _caps) = ctx
-        .get_hw_info(
-            dev_id,
-            std::ptr::from_mut(&mut info) as u64,
-            size_of::<vfio_sys::iommufd::IommuHwInfoArmSmmuv3>() as u32,
-        )
+        .get_hw_info(dev_id, &mut info)
         .context("IOMMU_GET_HW_INFO failed")?;
     if data_type != vfio_sys::iommufd::IOMMU_HW_INFO_TYPE_ARM_SMMUV3 {
         anyhow::bail!("unexpected host IOMMU hw info type {data_type} (expected ARM SMMUv3)");
@@ -89,18 +85,43 @@ pub struct SmmuAccelState {
     /// This HWPT provides GPA→HPA translation for all nested devices.
     /// Devices in BYPASS mode are attached directly to this HWPT.
     s2_parent_hwpt_id: u32,
+    /// Shared ABORT HWPT ID (nested HWPT under the vIOMMU with an abort STE).
+    ///
+    /// A nested HWPT binds to the vIOMMU, not to any single device, so one
+    /// abort HWPT is reusable by every device behind this vSMMU. Attaching to
+    /// it terminates all DMA (fail-closed), and the kernel validates the
+    /// device's physical SMMU against the vIOMMU's during attach — so it
+    /// doubles as a fail-closed probe target that never momentarily opens
+    /// BYPASS (which would expose guest memory to a misbehaving device).
+    abort_hwpt_id: u32,
 }
 
 impl SmmuAccelState {
     /// Create per-SMMU iommufd objects.
     ///
-    /// `dev_id` is any device bound to this IOMMU. The iommufd kernel
-    /// requires a device reference to determine which physical IOMMU
-    /// backs the vIOMMU.
+    /// `dev_id` is the first device bound to this vSMMU. The S2 parent HWPT
+    /// and the vIOMMU are both allocated against this device, which binds
+    /// them to the *physical* SMMU that backs it. The iommufd kernel requires
+    /// `s2_parent->smmu == device->smmu` for `IOMMU_VIOMMU_ALLOC`, and every
+    /// device later attached to this vSMMU's S2 parent must be behind the same
+    /// physical SMMU. The S2 parent is allocated per vSMMU (not per IOAS) so
+    /// that distinct vSMMUs — each backed by a different physical SMMU — can
+    /// share a single IOAS (one GPA→HPA identity map) while each owns the
+    /// nest-parent HWPT for its own physical SMMU.
     ///
-    /// `s2_parent_hwpt_id` is the S2 parent HWPT, previously allocated
-    /// via `IOMMU_HWPT_ALLOC` with `NEST_PARENT`.
-    pub fn new(ctx: Arc<IommufdCtx>, dev_id: u32, s2_parent_hwpt_id: u32) -> anyhow::Result<Self> {
+    /// `ioas_id` is the IOAS that provides the GPA→HPA identity map; the S2
+    /// parent HWPT is allocated against it with `NEST_PARENT`.
+    pub fn new(ctx: Arc<IommufdCtx>, dev_id: u32, ioas_id: u32) -> anyhow::Result<Self> {
+        let s2_parent_hwpt_id = ctx
+            .hwpt_alloc::<vfio_sys::iommufd::IommuHwptArmSmmuv3>(
+                vfio_sys::iommufd::IOMMU_HWPT_ALLOC_NEST_PARENT,
+                dev_id,
+                ioas_id,
+                vfio_sys::iommufd::IOMMU_HWPT_DATA_NONE,
+                None,
+            )
+            .context("failed to allocate S2 parent HWPT for accel SMMU")?;
+
         let viommu_id = ctx
             .viommu_alloc(
                 vfio_sys::iommufd::IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
@@ -109,16 +130,34 @@ impl SmmuAccelState {
             )
             .context("failed to allocate vIOMMU for accel SMMU")?;
 
+        // Allocate a shared abort HWPT under the vIOMMU. The STE is
+        // `[V=1, Config=ABORT]` (`[0x1, 0x0]`), which terminates all
+        // transactions; the kernel's `arm_smmu_validate_vste` accepts this
+        // encoding. Used as the fail-closed probe target below.
+        let abort_ste = vfio_sys::iommufd::IommuHwptArmSmmuv3 { ste: [0x1, 0x0] };
+        let abort_hwpt_id = ctx
+            .hwpt_alloc(
+                0, // flags: nested child, not a nest parent
+                dev_id,
+                viommu_id, // parent is the vIOMMU
+                vfio_sys::iommufd::IOMMU_HWPT_DATA_ARM_SMMUV3,
+                Some(&abort_ste),
+            )
+            .context("failed to allocate abort HWPT for accel SMMU")?;
+
         tracing::info!(
             viommu_id,
             s2_parent_hwpt_id,
-            "created SMMU accel state (vIOMMU)"
+            abort_hwpt_id,
+            ioas_id,
+            "created SMMU accel state (S2 parent HWPT + vIOMMU + abort HWPT)"
         );
 
         Ok(Self {
             ctx,
             viommu_id,
             s2_parent_hwpt_id,
+            abort_hwpt_id,
         })
     }
 
@@ -130,6 +169,12 @@ impl SmmuAccelState {
     /// Returns the S2 parent HWPT ID (used for BYPASS mode attachment).
     pub fn s2_parent_hwpt_id(&self) -> u32 {
         self.s2_parent_hwpt_id
+    }
+
+    /// Returns the shared abort HWPT ID (fail-closed; used for the attach
+    /// validation probe).
+    pub fn abort_hwpt_id(&self) -> u32 {
+        self.abort_hwpt_id
     }
 
     /// Returns the iommufd context.
@@ -148,9 +193,13 @@ impl SmmuAccelState {
 ///
 /// | STE.Config | Action |
 /// |------------|--------|
-/// | ABORT (0)  | Detach device — DMA faults |
+/// | ABORT (0)  | Attach to shared abort HWPT — DMA faults |
 /// | BYPASS (4) | Attach to S2 parent HWPT — identity GPA→HPA |
 /// | S1_TRANS (5) | Allocate nested HWPT with STE DW0-1, attach |
+///
+/// Each transition is a single `VFIO_DEVICE_ATTACH_IOMMUFD_PT`: the kernel
+/// replaces the device's current attachment atomically (no separate detach),
+/// so the device is never momentarily unattached while switching.
 ///
 /// # vDevice Allocation
 ///
@@ -176,8 +225,10 @@ pub struct IommufdStreamBackend {
 
 /// Per-device mutable state for an [`IommufdStreamBackend`].
 struct StreamBackendState {
-    /// Current nested HWPT ID, if S1 translation is active.
-    /// `None` when in ABORT (detached) or BYPASS (attached to S2 parent).
+    /// Current per-device nested HWPT ID, if S1 translation is active.
+    /// `None` when in ABORT (shared abort HWPT) or BYPASS (shared S2 parent) —
+    /// those HWPTs are owned by [`SmmuAccelState`] and are not destroyed on
+    /// switch; only a per-device nested HWPT tracked here is.
     current_nested_hwpt: Option<u32>,
     /// vDevice ID, lazily allocated on first `CFGI_STE` with `S1_TRANS`.
     vdevice_id: Option<u32>,
@@ -188,8 +239,8 @@ impl IommufdStreamBackend {
     ///
     /// `device_fd` must be a dup'd VFIO cdev fd (still bound to iommufd).
     ///
-    /// The device is detached (blocking domain = abort) immediately after
-    /// bind; this is the backend's initial internal state
+    /// The device is attached to the shared abort HWPT (fail-closed) by the
+    /// validation probe at bind time; this is the backend's initial state
     /// (`current_nested_hwpt: None`). The SMMU emulator drives the device to
     /// its correct initial policy when it registers the backend (see
     /// `SmmuSharedState::register_accel_device`): bypass (attach to the S2
@@ -207,15 +258,17 @@ impl IommufdStreamBackend {
         }
     }
 
-    /// Handle STE Config=ABORT: detach from any HWPT.
+    /// Handle STE Config=ABORT: attach to the shared abort HWPT.
     fn handle_abort(&self, state: &mut StreamBackendState) -> anyhow::Result<()> {
-        // Detach from current attachment (if any).
-        if state.current_nested_hwpt.is_some() {
-            vfio_sys::cdev::detach_pt(self.device_fd.as_fd())
-                .context("failed to detach device for ABORT")?;
-        }
+        // Attach to the shared abort HWPT. The abort STE terminates all DMA,
+        // so this is the fail-closed blocked state — equivalent to detaching,
+        // but it keeps the device attached to a known object and the attach
+        // atomically replaces any current attachment (no unattached window).
+        vfio_sys::cdev::attach_pt(self.device_fd.as_fd(), self.accel.abort_hwpt_id)
+            .context("failed to attach device to abort HWPT for ABORT")?;
 
-        // Destroy old nested HWPT.
+        // Destroy the old per-device nested HWPT (if any). The replace above
+        // already moved the device off it, so it has no attached devices.
         if let Some(old_hwpt) = state.current_nested_hwpt.take() {
             // Best-effort destroy — log but don't fail.
             if let Err(e) = self.accel.ctx.destroy(old_hwpt) {
@@ -227,23 +280,19 @@ impl IommufdStreamBackend {
             }
         }
 
-        tracing::debug!(dev_id = self.dev_id, "SMMU accel: STE → ABORT (detached)");
+        tracing::debug!(dev_id = self.dev_id, "SMMU accel: STE → ABORT (abort HWPT)");
         Ok(())
     }
 
     /// Handle STE Config=BYPASS: attach to S2 parent HWPT.
     fn handle_bypass(&self, state: &mut StreamBackendState) -> anyhow::Result<()> {
-        // Detach from current nested HWPT (if any).
-        if state.current_nested_hwpt.is_some() {
-            vfio_sys::cdev::detach_pt(self.device_fd.as_fd())
-                .context("failed to detach device for BYPASS switch")?;
-        }
-
-        // Attach to S2 parent HWPT (identity GPA→HPA).
+        // Attach to the S2 parent HWPT (identity GPA→HPA). The attach
+        // atomically replaces any current attachment (a previous nested HWPT),
+        // so no separate detach is needed.
         vfio_sys::cdev::attach_pt(self.device_fd.as_fd(), self.accel.s2_parent_hwpt_id)
             .context("failed to attach device to S2 parent HWPT for BYPASS")?;
 
-        // Destroy old nested HWPT.
+        // Destroy the old per-device nested HWPT (if any).
         if let Some(old_hwpt) = state.current_nested_hwpt.take() {
             if let Err(e) = self.accel.ctx.destroy(old_hwpt) {
                 tracing::warn!(
@@ -310,18 +359,13 @@ impl IommufdStreamBackend {
                 self.dev_id,
                 self.accel.viommu_id, // parent is the vIOMMU
                 vfio_sys::iommufd::IOMMU_HWPT_DATA_ARM_SMMUV3,
-                std::ptr::from_ref(&ste_data) as u64,
-                size_of::<vfio_sys::iommufd::IommuHwptArmSmmuv3>() as u32,
+                Some(&ste_data),
             )
             .context("failed to allocate nested HWPT for S1_TRANS")?;
 
-        // Detach from current attachment.
-        // The device may be attached to S2 parent (BYPASS) or an old
-        // nested HWPT (previous S1_TRANS).
-        vfio_sys::cdev::detach_pt(self.device_fd.as_fd())
-            .context("failed to detach device for S1_TRANS switch")?;
-
-        // Attach to the new nested HWPT.
+        // Attach to the new nested HWPT. The attach atomically replaces the
+        // current attachment (the S2 parent from BYPASS, the abort HWPT, or an
+        // old nested HWPT), so no separate detach is needed.
         vfio_sys::cdev::attach_pt(self.device_fd.as_fd(), new_hwpt)
             .context("failed to attach device to nested HWPT")?;
 
@@ -372,9 +416,7 @@ impl smmu::AcceleratedStreamBackend for IommufdStreamBackend {
             .hwpt_invalidate(
                 self.accel.viommu_id,
                 vfio_sys::iommufd::IOMMU_VIOMMU_INVALIDATE_DATA_ARM_SMMUV3,
-                std::ptr::from_ref(&invalidate_entry) as u64,
-                size_of::<vfio_sys::iommufd::IommuViommuArmSmmuv3Invalidate>() as u32,
-                1,
+                std::slice::from_ref(&invalidate_entry),
             )
             .context("iommufd HWPT_INVALIDATE (TLBI) failed")?;
 

@@ -560,13 +560,12 @@ struct IoasManager {
     #[inspect(skip)]
     ctx: Arc<vfio_sys::iommufd::IommufdCtx>,
     ioas_id: u32,
-    /// S2 parent HWPT for iommufd nested translation. Lazily allocated
-    /// on first device that requests nesting.
-    s2_parent_hwpt_id: Option<u32>,
-    /// Shared iommufd accel state (vIOMMU) per emulated SMMU, keyed by SMMU
-    /// id (root complex index). All devices behind the same vSMMU share a
-    /// single vIOMMU; the first device to request nesting creates it. The
-    /// serial actor loop is the mutual exclusion — no lock needed.
+    /// Shared iommufd accel state (S2 parent HWPT + vIOMMU) per emulated SMMU,
+    /// keyed by SMMU id (root complex index). All devices behind the same
+    /// vSMMU share a single S2 parent and vIOMMU; the first device to request
+    /// nesting creates it. Each vSMMU's S2 parent is allocated against its
+    /// first device, binding it to that device's physical SMMU. The serial
+    /// actor loop is the mutual exclusion — no lock needed.
     #[inspect(skip)]
     accel_states: HashMap<usize, Arc<crate::iommufd_nesting::SmmuAccelState>>,
     /// Keeps the DMA mapper registered with the region manager.
@@ -619,7 +618,6 @@ impl IoasManager {
             iommu_id,
             ctx,
             ioas_id,
-            s2_parent_hwpt_id: None,
             accel_states: HashMap::new(),
             _dma_handle: dma_handle,
             devices: Vec::new(),
@@ -669,39 +667,15 @@ impl IoasManager {
         // HWPT by the IommufdStreamBackend. For non-nesting, attach to the
         // IOAS for identity DMA.
         let nesting = if let Some(smmu_id) = smmu_id {
-            // Lazily allocate the S2 parent HWPT (one per IOAS).
-            let s2_hwpt_id = match self.s2_parent_hwpt_id {
-                Some(id) => id,
-                None => {
-                    let id = self
-                        .ctx
-                        .hwpt_alloc(
-                            vfio_sys::iommufd::IOMMU_HWPT_ALLOC_NEST_PARENT,
-                            devid,
-                            self.ioas_id,
-                            vfio_sys::iommufd::IOMMU_HWPT_DATA_NONE,
-                            0,
-                            0,
-                        )
-                        .context("failed to allocate S2 parent HWPT for nesting")?;
-                    tracing::info!(
-                        iommu_id = self.iommu_id,
-                        ioas_id = self.ioas_id,
-                        s2_parent_hwpt_id = id,
-                        "allocated S2 parent HWPT for iommufd nesting"
-                    );
-                    self.s2_parent_hwpt_id = Some(id);
-                    id
-                }
-            };
-
             // Query the physical SMMU's capabilities backing this device.
             let host_caps = crate::iommufd_nesting::query_host_caps(&self.ctx, devid)
                 .context("failed to query host SMMU capabilities")?;
 
-            // Get or create the shared vIOMMU for this emulated SMMU. The
-            // first device behind the SMMU allocates it; the rest reuse it,
-            // so one emulated SMMU maps to one iommufd vIOMMU.
+            // Get or create the shared accel state (S2 parent HWPT + vIOMMU)
+            // for this emulated SMMU. The first device behind the vSMMU
+            // allocates it; the rest reuse it, so one emulated SMMU maps to
+            // one S2 parent and one vIOMMU. The S2 parent is allocated against
+            // the first device, binding it to that device's physical SMMU.
             let accel_state = if let Some(existing) = self.accel_states.get(&smmu_id) {
                 existing.clone()
             } else {
@@ -709,13 +683,34 @@ impl IoasManager {
                     crate::iommufd_nesting::SmmuAccelState::new(
                         self.ctx.clone(),
                         devid,
-                        s2_hwpt_id,
+                        self.ioas_id,
                     )
                     .context("failed to create SMMU accel state")?,
                 );
                 self.accel_states.insert(smmu_id, state.clone());
                 state
             };
+
+            // Eagerly attach the device to the vSMMU's shared abort HWPT. This
+            // validates that the device can attach to the vIOMMU at all: the
+            // kernel requires every device under a vSMMU to be behind the same
+            // physical SMMU as the vIOMMU (arm_smmu_attach_dev_nested rejects a
+            // mismatch with EINVAL). Doing it now turns a misconfiguration —
+            // one emulated SMMU spanning multiple physical SMMUs — into a clear
+            // VM-start failure instead of a confusing later failure when the
+            // guest enables MSI-X or programs a stream-table entry. The remedy
+            // for such a topology is one emulated SMMU (root complex) per
+            // physical SMMU.
+            //
+            // The abort HWPT is the device's fail-closed initial state: its STE
+            // terminates all DMA, so the device cannot reach guest memory
+            // before the guest programs the SMMU. The device stays attached to
+            // it (no detach) — the SMMU emulator drives it to its boot policy
+            // (bypass/abort/translate) when the stream backend is registered,
+            // and each transition atomically replaces this attachment.
+            vfio_sys::cdev::attach_pt(cdev.as_fd(), accel_state.abort_hwpt_id()).with_context(
+                || format!("device {pci_id} could not attach to the vSMMU's abort HWPT"),
+            )?;
 
             // Dup the cdev fd for the stream backend to use for attach/detach
             // after CdevDevice::into_device() consumes the original.

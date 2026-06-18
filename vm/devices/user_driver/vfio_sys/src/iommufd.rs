@@ -429,22 +429,31 @@ impl IommufdCtx {
     /// Allocate a hardware page table (HWPT).
     ///
     /// For a **nesting parent** (S2): set `flags = IOMMU_HWPT_ALLOC_NEST_PARENT`,
-    /// `pt_id` = IOAS ID, `data_type = IOMMU_HWPT_DATA_NONE`.
+    /// `pt_id` = IOAS ID, `data_type = IOMMU_HWPT_DATA_NONE`, and pass
+    /// `data = None`.
     ///
     /// For a **nested child** (S1): set `flags = 0`, `pt_id` = parent HWPT ID
-    /// or vIOMMU ID, `data_type = IOMMU_HWPT_DATA_ARM_SMMUV3`, and pass
-    /// the STE data via `data_uptr`/`data_len`.
+    /// or vIOMMU ID, `data_type = IOMMU_HWPT_DATA_ARM_SMMUV3`, and pass the
+    /// type-specific payload (e.g. [`IommuHwptArmSmmuv3`]) via `data`.
+    ///
+    /// The kernel reads `size_of::<T>()` bytes from `data`; passing it as a
+    /// borrow lets the borrow checker guarantee the pointer is valid for the
+    /// duration of the (synchronous) ioctl. `data_type` must match the type
+    /// `T` the kernel expects — a mismatch is an ABI bug, not unsafety.
     ///
     /// Returns the kernel-assigned HWPT object ID.
-    pub fn hwpt_alloc(
+    pub fn hwpt_alloc<T>(
         &self,
         flags: u32,
         dev_id: u32,
         pt_id: u32,
         data_type: u32,
-        data_uptr: u64,
-        data_len: u32,
+        data: Option<&T>,
     ) -> anyhow::Result<u32> {
+        let (data_uptr, data_len) = match data {
+            Some(data) => (std::ptr::from_ref(data) as u64, size_of::<T>() as u32),
+            None => (0, 0),
+        };
         let mut cmd = IommuHwptAlloc {
             size: size_of::<IommuHwptAlloc>() as u32,
             flags,
@@ -458,8 +467,9 @@ impl IommufdCtx {
             fault_id: 0,
             __reserved2: 0,
         };
-        // SAFETY: fd is valid, struct correctly constructed, data_uptr
-        // (if non-zero) points to a valid struct for data_len bytes.
+        // SAFETY: fd is valid and the struct is correctly constructed. When
+        // present, `data_uptr`/`data_len` describe a live `&T` borrowed for
+        // this call, so the kernel reads only valid memory.
         unsafe {
             ioctl::iommu_hwpt_alloc(self.file.as_raw_fd(), &mut cmd)
                 .context("IOMMU_HWPT_ALLOC failed")?;
@@ -469,27 +479,26 @@ impl IommufdCtx {
 
     /// Query hardware information for a device's IOMMU.
     ///
-    /// Returns `(out_data_type, out_capabilities)`. The type-specific data
-    /// is written to the buffer at `data_uptr` (up to `data_len` bytes).
-    pub fn get_hw_info(
-        &self,
-        dev_id: u32,
-        data_uptr: u64,
-        data_len: u32,
-    ) -> anyhow::Result<(u32, u64)> {
+    /// The kernel writes the type-specific data (e.g. [`IommuHwInfoArmSmmuv3`])
+    /// into `data`; passing it as a mutable borrow guarantees the buffer is
+    /// valid for `size_of::<T>()` bytes for the duration of the ioctl.
+    ///
+    /// Returns `(out_data_type, out_capabilities)`.
+    pub fn get_hw_info<T>(&self, dev_id: u32, data: &mut T) -> anyhow::Result<(u32, u64)> {
         let mut cmd = IommuGetHwInfo {
             size: size_of::<IommuGetHwInfo>() as u32,
             flags: 0,
             dev_id,
-            data_len,
-            data_uptr,
+            data_len: size_of::<T>() as u32,
+            data_uptr: std::ptr::from_mut(data) as u64,
             out_data_type: 0,
             out_max_pasid_log2: 0,
             __reserved: [0; 3],
             out_capabilities: 0,
         };
-        // SAFETY: fd is valid, struct correctly constructed, data_uptr
-        // points to a valid buffer for data_len bytes.
+        // SAFETY: fd is valid and the struct is correctly constructed.
+        // `data_uptr`/`data_len` describe a live `&mut T` borrowed for this
+        // call, so the kernel writes only into valid memory.
         unsafe {
             ioctl::iommu_get_hw_info(self.file.as_raw_fd(), &mut cmd)
                 .context("IOMMU_GET_HW_INFO failed")?;
@@ -499,30 +508,31 @@ impl IommufdCtx {
 
     /// Invalidate IOMMU caches via a nested HWPT or vIOMMU.
     ///
-    /// `hwpt_id` is a nested HWPT ID or vIOMMU ID. `data_uptr` points to
-    /// an array of invalidation entries (e.g., `IommuViommuArmSmmuv3Invalidate`).
-    /// `entry_len` is the size of each entry, `entry_num` is the count.
+    /// `hwpt_id` is a nested HWPT ID or vIOMMU ID. `entries` is the array of
+    /// invalidation entries (e.g. [`IommuViommuArmSmmuv3Invalidate`]); passing
+    /// it as a slice guarantees the pointer and length describe valid memory
+    /// for the duration of the ioctl. `data_type` must match the entry type
+    /// `T` the kernel expects.
     ///
     /// Returns the number of entries successfully processed.
-    pub fn hwpt_invalidate(
+    pub fn hwpt_invalidate<T>(
         &self,
         hwpt_id: u32,
         data_type: u32,
-        data_uptr: u64,
-        entry_len: u32,
-        entry_num: u32,
+        entries: &[T],
     ) -> anyhow::Result<u32> {
         let mut cmd = IommuHwptInvalidate {
             size: size_of::<IommuHwptInvalidate>() as u32,
             hwpt_id,
-            data_uptr,
+            data_uptr: entries.as_ptr() as u64,
             data_type,
-            entry_len,
-            entry_num,
+            entry_len: size_of::<T>() as u32,
+            entry_num: entries.len() as u32,
             __reserved: 0,
         };
-        // SAFETY: fd is valid, struct correctly constructed, data_uptr
-        // points to a valid array of entry_num entries.
+        // SAFETY: fd is valid and the struct is correctly constructed.
+        // `data_uptr`/`entry_len`/`entry_num` describe the live `&[T]` borrowed
+        // for this call, so the kernel reads only valid memory.
         unsafe {
             ioctl::iommu_hwpt_invalidate(self.file.as_raw_fd(), &mut cmd)
                 .context("IOMMU_HWPT_INVALIDATE failed")?;
