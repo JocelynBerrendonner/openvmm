@@ -99,7 +99,7 @@ impl AsyncResolveResource<DiskHandleKind, BlockDeviceDiskHandle> for StaticBlock
             input.driver_source.current(),
             None,
             None,
-            false,
+            true,
         )
         .await
         .map_err(ResolveDiskError::NewDevice)?;
