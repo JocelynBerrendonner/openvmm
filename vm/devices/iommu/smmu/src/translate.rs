@@ -162,14 +162,6 @@ pub fn lookup_cd(
         s1_context_ptr.wrapping_add((ssid as u64) * (crate::spec::cd::CD_SIZE as u64)) & oas_mask;
     let cd: Cd = gm.read_plain(cd_addr).map_err(|_| SmmuFault::bad_cd(sid))?;
 
-    tracelimit::info_ratelimited!(
-        sid,
-        cd_addr = format_args!("{:#x}", cd_addr),
-        cd_dw0 = format_args!("{:#018x}", u64::from(cd.qw0)),
-        cd_dw1 = format_args!("{:#018x}", u64::from(cd.qw1)),
-        "lookup_cd: read CD from guest memory"
-    );
-
     if !cd.valid() {
         tracelimit::warn_ratelimited!(
             sid,
