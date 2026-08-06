@@ -263,6 +263,7 @@ pub enum Aarch64Register {
     Pc(u64),
     X0(u64),
     X1(u64),
+    X2(u64),
     Cpsr(u64),
     VbarEl1(u64),
     Ttbr0El1(u64),
@@ -297,6 +298,8 @@ impl From<Aarch64Register> for igvm::registers::AArch64Register {
             Aarch64Register::Pc(v) => igvm_reg::Pc(v),
             Aarch64Register::X0(v) => igvm_reg::X0(v),
             Aarch64Register::X1(v) => igvm_reg::X1(v),
+            // X2 carries the mu_msvm SEC platform type; never emitted to IGVM.
+            Aarch64Register::X2(_) => unreachable!("X2 is not an IGVM register"),
             Aarch64Register::Cpsr(v) => igvm_reg::Cpsr(v),
             Aarch64Register::SctlrEl1(v) => igvm_reg::SctlrEl1(v),
             Aarch64Register::TcrEl1(v) => igvm_reg::TcrEl1(v),

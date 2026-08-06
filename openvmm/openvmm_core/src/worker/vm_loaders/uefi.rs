@@ -231,5 +231,14 @@ pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
     )
     .map_err(Error::Loader)?;
 
-    Ok(loader.initial_regs())
+    let regs = loader.initial_regs();
+    // mu_msvm SEC reads the platform type from x2 (HyperV=0, Generic=1); pass
+    // Generic when HV#1 is disabled so the firmware omits Hyper-V facilities.
+    #[cfg(guest_arch = "aarch64")]
+    let regs = {
+        let mut regs = regs;
+        regs.push(Register::X2(if settings.hv { 0 } else { 1 }));
+        regs
+    };
+    Ok(regs)
 }
